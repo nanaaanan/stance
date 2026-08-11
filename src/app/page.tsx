@@ -1,4 +1,5 @@
 import { AuthBootstrap } from '@/components/auth-bootstrap'
+import { SmokeTest } from '@/components/smoke-test'
 
 export default function Home() {
   return (
@@ -11,6 +12,7 @@ export default function Home() {
       </p>
       <p className="text-xs to-neutral-400">마지막 데이터 갱신 : - (수집 전)</p>
       <AuthBootstrap />
+      <SmokeTest />
     </main>
   )
 }
