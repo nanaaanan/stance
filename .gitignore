@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +40,20 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# data pipeline artifacts
+/raw/
+/scripts/raw/
+/scripts/out/
+
+# python data processing
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# rest client env files(personal)
+http-client.private.env.json
+
+# macOS
+.DS_Store
