@@ -1,0 +1,43 @@
+###############################################################
+# 국토교통부 아파트 전월세 실거래가
+#
+# 매매와 다른 점 (파싱 코드를 공유하면 안 되는 이유):
+#   - cdealType(해제), dealingGbn(직거래) 필드가 아예 없다
+#     - 해제 중복 제거, 직거래 제외 규칙은 매매 전용이다
+#   - roadnm 이 "삼성로 212" 처럼 번지를 이미 포함한다. 매매식으로 조립하면 "삼성로 212 212"가 된다.
+#   - umdCd(법정동 코드)가 없다. umdNm(동 이름)만 있다
+#   - 필드명이 일부 전부 소문자다 (roadnm, roadnmbonbun ...)
+#   - parse_trade() / parse_rent() 를 분리한다
+#
+# 조인은 aptSeq 로 한다. 양쪽 모두 보유하며 강남구 실측 결측 0건.
+# deposit / preDeposit 단위는 만원, 천단위 콤마 포함 문자열 ("65,000" = 6억 5천)
+# dealMonth / dealDay 는 zero-pad 없음 (7, 19)
+###############################################################
+
+@host = https://apis.data.go.kr/1613000/RTMSDataSvcAptRent
+@path = /getRTMSDataSvcAptRent
+@key = {{$dotenv DATA_GO_KR_KEY}}
+
+### [1] 기본 호출 — 강남구 2026년 7월
+# 실측 totalCount: 2026.07 = 1,044 / 2024.07 = 1,645 → numOfRows=1000 이면 월 2페이지
+GET {{host}}{{path}}?serviceKey={{key}}&LAWD_CD=11680&DEAL_YMD=202607&pageNo=1&numOfRows=1000
+
+### [2] 2페이지 — 누락 방지 확인
+GET {{host}}{{path}}?serviceKey={{key}}&LAWD_CD=11680&DEAL_YMD=202607&pageNo=2&numOfRows=1000
+
+### [3] 하면 안 되는 호출 — 잘못 판단한 방식
+# numOfRows=10 으로 받고 "preDeposit 이 전부 비어 있다" 고 결론 내렸고 틀림.
+# 실측: 앞 10건의 contractType 공백률이 강남,동작 모두 100%.
+#      무작위 표본이 아니라 정렬된 결과의 앞부분. 공백 66건(강남)이 응답 인덱스 0~65 에 완전히 몰려 있다
+GET {{host}}{{path}}?serviceKey={{key}}&LAWD_CD=11680&DEAL_YMD=202407&pageNo=1&numOfRows=10
+
+### [4] 갱신계약 - preDeposit 실측
+# 강남구(11680) 1,000건 / 동작구(11590) 700건 전수 분석 결과
+# 역전세는 preDeposit 단일행 비교로 계산한다. 24개월 자기조인 불필요.
+# 전세가율 모수는 monthlyRent=0 인 순수 전세만. 강남은 순수 전세가 55%뿐이라 이 규칙 없이는 강남 전세가율이 통째로 왜곡된다.
+# 역전세 신호는 단지의 1/3~1/2 에서만 뜬다. 빈 카드로 두지 말고 "최근 갱신 계약 없음" 표시.
+GET {{host}}{{path}}?serviceKey={{key}}&LAWD_CD=11680&DEAL_YMD=202407&pageNo=1&numOfRows=1000
+
+### [5] 구별 대조 — 동작구
+# 파이프라인 설계는 강남구 기준으로 확정해도됨. 화면 숫자만 구별로 계산한다.
+GET {{host}}{{path}}?serviceKey={{key}}&LAWD_CD=11590&DEAL_YMD=202407&pageNo=1&numOfRows=1000

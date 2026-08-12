@@ -1,0 +1,28 @@
+###############################################################
+# 브이월드 Geocoder API 2.0 — 좌표 결손분 보완용
+#
+# 용도 축소 경위:
+#   계획은 실거래 지번주소를 전량 지오코딩하는 배치였다.
+#   서울시 공동주택 CSV에 좌표값이 이미 들어 있다는 것을 확인하고
+#   전량 배치를 폐기했다. 남은 용도는 CSV에 없는 단지(약 394건)뿐이다.
+#
+# 인증키: 개발계정 6개월 유효, 일 4만건 한도
+# 입력: 실거래 jibun 필드를 그대로 사용한다 ("891-6", "826-29" 형태)
+#
+# 실패 시 처리: 추측성 정보는 애초에 제공하지 않는다.
+#   지오코딩이 실패하면 좌표를 비운 채로 둔다. 근처 좌표를 넣거나 동 중심점으로
+#   대체하지 않는다. 화면에는 "위치 정보 미확인" 으로 표시하고,
+#   지하철·초등학교 거리 카드를 띄우지 않는다.
+#   틀린 거리를 보여주는 것이 거리를 안 보여주는 것보다 나쁘다.
+###############################################################
+
+@key = {{$dotenv VWORLD_KEY}}
+
+### [1] 지번주소 -> 좌표
+# type=PARCEL 은 지번, ROAD 는 도로명. 실거래는 jibun 을 주므로 PARCEL.
+# 응답 result.point.x = 경도(lng), y = 위도(lat). 순서 주의.
+GET https://api.vworld.kr/req/address?service=address&request=getcoord&version=2.0&crs=epsg:4326&type=PARCEL&address=서울특별시 강남구 대치동 316&format=json&key={{key}}
+
+### [2] 실패 케이스 확인 — 존재하지 않는 주소
+# status:"NOT_FOUND" 가 온다. 이때 좌표를 만들어내지 않는다.
+GET https://api.vworld.kr/req/address?service=address&request=getcoord&version=2.0&crs=epsg:4326&type=PARCEL&address=서울특별시 강남구 없는동 999&format=json&key={{key}}
