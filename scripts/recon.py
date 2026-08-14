@@ -30,10 +30,10 @@
     몇번 문제를 해결하면 매칭률이 얼마나 오르는지 계산할 수 있고, 현재 설계대로 진행해도 괜찮은지 판단할 수 있다.
     road_key() 열이 빈 행은 원인 3, 값이 있는데 안 붙은 행은 원인 1 또는 2다.
 
-실행
+레포 루트에서 실행
     export DATA_GO_KR_KEY='디코딩_서비스키'
-    python3 recon.py                수집 + 리포트  (약 40콜)
-    python3 recon.py --report-only  재파싱만       (API 호출 0)
+    python3 scripts/recon.py                수집 + 리포트  (약 40콜)
+    python3 scripts/recon.py --report-only  재파싱만       (API 호출 0)
 
     --key 인자도 되지만 셸 히스토리에 평문으로 남으므로 환경변수를 쓴다.
     서비스키는 '디코딩' 키여야 한다. urlencode() 로 조립하므로 인코딩 키를 넣으면 이중 인코딩되어 에러 30 이 난다.
@@ -78,8 +78,8 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 # ====================== 필요하면 여기만 수정 ======================
-LAWD_CD   = "11440"        # 마포구. 강남 11680 / 노원 11350 / 마포 11440 / 관악 11620 / 성동 11200 / 동작 11590 / 강동 11740
-SIGUNGU   = "마포구"        # LAWD_CD와 반드시 일치시킬 것
+LAWD_CD   = "11680"        # 강남구. 강남 11680 / 노원 11350 / 마포 11440 / 관악 11620 / 성동 11200 / 동작 11590 / 강동 11740
+SIGUNGU   = "강남구"        # LAWD_CD와 반드시 일치시킬 것
 START_YM  = "202308"       # 36개월 전
 END_YM    = "202607"       # 2026-08은 신고 유입 중이라 제외
 CSV_NAME  = "seoul-apt-info.csv"
@@ -92,7 +92,7 @@ BASE = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcApt
 
 HERE     = pathlib.Path(__file__).resolve().parent   # scripts/
 ROOT     = HERE.parent                               # 레포 루트
-DATA     = ROOT / "data"                             # 숫자의 근거. 커밋 대상
+DATA     = ROOT / "data"                             # 프로젝트 데이터 (의존성, 근거)
 CSV_PATH = DATA / CSV_NAME
 RAW      = HERE / "raw" / "trade"                    # 원본 응답. gitignore
 
