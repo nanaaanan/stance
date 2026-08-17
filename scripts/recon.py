@@ -34,6 +34,7 @@
     export DATA_GO_KR_KEY='디코딩_서비스키'
     python3 scripts/recon.py                수집 + 리포트  (약 40콜)
     python3 scripts/recon.py --report-only  재파싱만       (API 호출 0)
+    python3 scripts/recon.py --audit-key    자연키 감사    (API 호출 0. --rent 로 전월세)
 
     --key 인자도 되지만 셸 히스토리에 평문으로 남으므로 환경변수를 쓴다.
     서비스키는 '디코딩' 키여야 한다. urlencode() 로 조립하므로 인코딩 키를 넣으면 이중 인코딩되어 에러 30 이 난다.
@@ -74,6 +75,7 @@ import math
 import pathlib
 import collections
 import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -95,6 +97,7 @@ ROOT     = HERE.parent                               # 레포 루트
 DATA     = ROOT / "data"                             # 프로젝트 데이터 (의존성, 근거)
 CSV_PATH = DATA / CSV_NAME
 RAW      = HERE / "raw" / "trade"                    # 원본 응답. gitignore
+RAW_RENT = HERE / "raw" / "rent"                     # 전월세 원본 응답. gitignore
 
 
 # -------------------------- 준비 --------------------------
@@ -339,7 +342,7 @@ def report():
     tot_d = sum(a["거래건수"] for a in per)
     wd = sum(a["거래건수"] for a in matched)
     dup = collections.Counter(a["kaptCode"] for a in matched)
-    n_cancel = sum(1 for r in rows if r["cdealType"] == "O")
+    n_cancel = sum(1 for r in rows if r["cdealType"] == "O") # 알파벳 O = 해제 신고가 발생함
     n_direct = sum(1 for r in rows if r["dealingGbn"] == "직거래")
 
     print("=" * 72)
@@ -373,12 +376,506 @@ def report():
             w.writerows(data)
         print(f"\n-> {path}")
 
+# -----------------------------------------------------------------------------
+# 자연키 감사 정찰 스크립트
+#
+# 최근 3개월을 반복 수집하므로 DB 는 재수집에 멱등적이어야 한다.
+# 자연키 upsert 가 가능한지, 값 변경을 이력으로 추적할 후보가 있는지 검증한다.
+#   - 컬럼 조합만으로 거래가 유일하게 구분되는지  -> audit_natural_key
+#   - 금액 변경을 같은 identity 로 추적 가능한지  -> audit_amount_tracking
+#   - 컬럼별 실제 형식과 채움 상태                -> audit_fields
+# -----------------------------------------------------------------------------
+
+# 후보 A: 자연키 후보. 강남구 36개월 전수 확인 -> 매매 자연키 unique 인덱스의 근거
+# 후보 B: 감사 실험. 자연키 후보 아님
+#   - 목적: 금액만 정정된 같은 거래를 같은 identity 로 추적 가능한지
+#   - 이 키로 묶였는데 금액이 다른 그룹 = 정정 후보
+KEY_TRADE_BASE        = ("aptSeq", "dealYear", "dealMonth", "dealDay",
+                         "excluUseAr", "floor")
+KEY_TRADE_WITH_AMOUNT = KEY_TRADE_BASE + ("dealAmount",)
+
+KEY_RENT = ("aptSeq", "dealYear", "dealMonth", "dealDay",
+            "excluUseAr", "floor", "deposit", "monthlyRent")
+
+_NUMERIC = ("dealAmount", "dealYear", "dealMonth", "dealDay",
+            "floor", "deposit", "monthlyRent")
+
+_AREA_SCALE = Decimal("0.0001")     # exclu_use_ar 컬럼 타입 numeric(9,4)와 동일
+
+_RAW_DIR = {"trade": RAW, "rent": RAW_RENT}
+
+
+def _items(path):
+    """XML 파일 하나 -> dict 리스트. 정상 응답이 아니면 빈 리스트.
+
+    parse_raw 와 따로 두는 이유
+      - parse_raw 는 12개 필드 화이트리스트. 응답에 없는 태그와 안 읽는 태그를 구분 못 함
+      - 감사는 실제로 온 태그만 담아야 '태그없음' 집계가 성립
+
+    totalCount 검사
+      - 인증 실패 응답도 유효한 XML. item 이 0개라 '거래 0건' 과 구분되지 않음
+      - collect() 가 기존 파일을 지울 때 쓰는 기준과 동일
+
+    _source_file: 원본에 없는 칸. API 필드와 구분되도록 밑줄 접두사
+      - 파일명 형식 {구}_{계약월}_{페이지}.xml
+      - 샘플 출력의 출처 표시, audit_fields 의 파일명 계약월 대조에 사용
+    """
+    text = path.read_text(encoding="utf-8")
+    if "<totalCount>" not in text:
+        print(f"[건너뜀] 정상 응답 아님: {path.name}")
+        return []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        print(f"[건너뜀] 파싱 실패: {path.name}")
+        return []
+    rows = []
+    for item in root.iter("item"):
+        row = {c.tag: (c.text or "").strip() for c in item}
+        row["_source_file"] = path.name
+        rows.append(row)
+    return rows
+
+
+def _norm_one(field, value):
+    """키 한 칸 -> DB 저장 표기. 변환 불가 시 ValueError.
+
+    면적 반올림
+      - numeric(9,4)와 같은 자리에서 끊음
+      - Postgres numeric = 사사오입 -> ROUND_HALF_UP 명시
+      - 파이썬 Decimal 기본값은 은행가 반올림. 그대로 두면 84.12345 에서 불일치
+      - float 경유 금지. 십진 소수가 근사값이 됨
+    """
+    if field == "excluUseAr":
+        try:
+            return str(Decimal(value).quantize(_AREA_SCALE, rounding=ROUND_HALF_UP))
+        except InvalidOperation:
+            raise ValueError(f"{field}={value!r}") from None
+    if field in _NUMERIC:
+        try:
+            return str(int(value.replace(",", "")))
+        except ValueError:
+            raise ValueError(f"{field}={value!r}") from None
+    return value
+
+
+# 빈 값을 기본값으로 바꾸는 유일한 칸
+#   - 전세는 monthlyRent가 빈 값. 버리면 감사에서 전세 전량이 빠짐
+#   - 수집 스크립트의 결측 처리와 같은 규칙 필수. 감사가 DB 보다 엄격해도 느슨해도 안 됨
+#   - 다른 칸에는 적용하지 않음. deposit 결측과 0은 다른 사실
+_BLANK_DEFAULT = {"monthlyRent": "0"}
+
+
+def _key_of(row, fields):
+    """행 하나 -> 자연키 튜플. 실패 시 (None, 사유)
+
+    사유는 둘뿐
+      - 결측: 키 칸이 빔. 수집 단계도 동일 기준으로 버림
+      - 형식: 값은 있으나 컬럼 타입 변환 불가. DB 가 22P02 로 거부
+    """
+    out = []
+    for f in fields:
+        v = (row.get(f) or "").strip()
+        if not v:
+            v = _BLANK_DEFAULT.get(f, "")
+        if not v:
+            return None, f"결측 {f}"
+        try:
+            out.append(_norm_one(f, v))
+        except ValueError as e:
+            return None, f"형식 {e}"
+    return tuple(out), None
+
+
+def _bucket(rows, fields):
+    """자연키별 그룹핑. 키 생성 실패 행은 사유 목록으로 분리."""
+    buckets = collections.defaultdict(list)
+    dropped = []
+    for r in rows:
+        key, reason = _key_of(r, fields)
+        if key is None:
+            dropped.append(reason)
+        else:
+            buckets[key].append(r)
+    return buckets, dropped
+
+
+def _print_dropped(dropped, total):
+    """제외 행을 사유별 출력. 조용한 누락 방지용."""
+    print(f"  키를 만들 수 있는 행         : {total - len(dropped):,}")
+    print(f"  키를 못 만든 행              : {len(dropped):,}   "
+          f"<- 수집이 버리거나 DB 가 거부하는 행")
+    for reason, n in collections.Counter(dropped).most_common(6):
+        print(f"      {reason:26s} {n:,}")
+
+
+def summarize(group):
+    """자연키 하나에 묶인 행들의 성격 집계.
+
+    cdealType 분류
+      - 태그 결손과 빈 값은 동일 취급 = 정상. 이 API 에서 둘 다 "해제 아님"
+      - unknown = 'O'도 빈 값도 아닌 값. 0이 아니면 판정 규칙 재검토 대상
+      - 전월세 응답에는 cdealType 자체가 없어 전 행이 정상으로 잡힘
+
+    trade_count: 자연키가 나타내는 거래 건수 추정치 (원본에 거래 ID 없음)
+      - 정상 n건        -> n
+      - 정상 0 + 해제만  -> 1   (해제할 거래가 없으면 해제 통지도 없음)
+      - 전 행 unknown  -> 0   (판정 불가. 합계 지표에서 제외)
+
+    ambiguous_cancel: 정상 2건 이상 + 해제 존재. 해제 대상 식별 불가 표시
+    """
+    normal  = sum(1 for r in group if (r.get("cdealType") or "") == "")
+    cancel  = sum(1 for r in group if (r.get("cdealType") or "") == "O")
+    unknown = len(group) - normal - cancel
+    return {
+        "rows": len(group),
+        "normal": normal,
+        "cancel": cancel,
+        "unknown": unknown,
+        "trade_count": normal if normal else (1 if cancel else 0),
+        "ambiguous_cancel": normal > 1 and cancel > 0,
+    }
+
+
+def _norm_row(row):
+    """_source_file 을 뺀 전 칸. 행 동일성 비교용."""
+    return tuple(sorted((f, v) for f, v in row.items() if f != "_source_file"))
+
+
+def _classify(group):
+    """중복 그룹의 성격 -> (성격, 충돌 칸 목록).
+
+    unique 인덱스가 지우는 행이 실제 정보 손실인지 가르는 기준
+
+    identical: 전 칸 동일. 같은 행이 두 번 온 것. 지워도 손실 없음
+    subset:    갈리는 칸이 전부 '빈 값 vs 채워진 값'. 채워진 행을 남기면 손실 없음
+    conflict:  비어 있지 않은 값이 둘 이상인 칸이 있음. 별개 거래인지 정정인지 판정 불가
+
+    subset 이 최대 유형이면 적재는 빈 값이 채워진 값을 덮어쓰지 않아야 한다
+    """
+    if len({_norm_row(r) for r in group}) == 1:
+        return "identical", []
+    conflict = [f for f in set().union(*(set(r) for r in group))
+                if f != "_source_file"
+                and len({(r.get(f) or "").strip() for r in group} - {""}) > 1]
+    return ("conflict" if conflict else "subset"), conflict
+
+
+def _load_rows(kind):
+    src = _RAW_DIR[kind]
+    files = sorted(src.glob(f"{LAWD_CD}_*.xml"))
+    if not files:
+        print(f"[중단] {src}/{LAWD_CD}_*.xml 에 파일이 없다.")
+        return None, 0
+    rows = []
+    for f in files:
+        rows.extend(_items(f))
+    return rows, len(files)
+
+
+def _amount_sort_key(v):
+    """숫자 우선 정렬. 이상값은 뒤로 보내고 예외는 내지 않음."""
+    return (0, int(v), "") if v.isdigit() else (1, 0, v)
+
+
+def audit_natural_key(kind="trade"):
+    """후보 A(금액 포함) 유일성 감사. 행 하나짜리 키까지 포함한 전수.
+
+    전수인 이유: 해제 단독건이 trade_count=1 규칙의 대표 사례
+    """
+    rows, n_files = _load_rows(kind)
+    if rows is None:
+        return
+    key = KEY_TRADE_WITH_AMOUNT if kind == "trade" else KEY_RENT
+
+    buckets, dropped = _bucket(rows, key)
+    stats = {k: summarize(g) for k, g in buckets.items()}
+
+    single = sum(1 for s in stats.values() if s["rows"] == 1)
+    multi  = len(stats) - single
+
+    # 아래 4개는 '행 둘 이상인 키'의 분할. 각각 독립 집계
+    normal_only = sum(1 for s in stats.values()
+                      if s["rows"] > 1 and s["cancel"] == 0 and s["unknown"] == 0)
+    mixed       = sum(1 for s in stats.values()
+                      if s["rows"] > 1 and s["normal"] > 0 and s["cancel"] > 0
+                      and s["unknown"] == 0)
+    cancel_only = sum(1 for s in stats.values()
+                      if s["rows"] > 1 and s["cancel"] == s["rows"])
+    multi_other = sum(1 for s in stats.values()
+                      if s["rows"] > 1 and s["unknown"] > 0)
+    parts = normal_only + mixed + cancel_only + multi_other
+
+    # 지워지는 행이 실제 손실인지 판정
+    #   - 해제 행 제외. 해제는 정제 단계에서 걸러지므로 유일성 판단 대상이 아님
+    #   - 전월세는 cdealType 이 없어 전 행이 남음
+    # 대상은 '행 둘 이상인 키'가 아니라 '정상 행이 2개 이상인 키'.
+    # 위 4분할과 모수가 다르므로 shape_base 를 따로 세워 출력에 명시
+    amb = sum(1 for s in stats.values() if s["ambiguous_cancel"])
+    shape_base = normal_only + amb
+    shape, shape_rows = collections.Counter(), collections.Counter()
+    conflict_fields = collections.Counter()
+    for g in buckets.values():
+        alive = [r for r in g if (r.get("cdealType") or "") == ""]
+        if len(alive) <= 1:
+            continue
+        c, fields = _classify(alive)
+        shape[c] += 1
+        shape_rows[c] += len(alive)
+        for f in fields:
+            conflict_fields[f] += 1
+
+    # unknown은 정상/해제와 다른 축. multi의 하위 항목이 아니므로 분리 출력
+    unknown_any = sum(1 for s in stats.values() if s["unknown"] > 0)
+
+    cancel_single = sum(1 for s in stats.values()
+                        if s["rows"] == 1 and s["cancel"] == 1)
+
+    print(f"\n[{kind} / 금액 포함] 파일 {n_files}개 / 총 {len(rows):,}행")
+    _print_dropped(dropped, len(rows))
+    print(f"  고유 키                      : {len(stats):,}\n")
+    print(f"  행 하나짜리 키              : {single:,}")
+    print(f"  행 둘 이상인 키             : {multi:,}")
+    print(f"    - 정상만 여러 건           : {normal_only:,}   (trade_count > 1 대상)")
+    if kind == "trade":
+        print(f"    - 정상 + 해제 혼재         : {mixed:,}")
+        print(f"    - 해제만 여러 건           : {cancel_only:,}")
+    print(f"    - 그 밖 (unknown 섞임)     : {multi_other:,}")
+    print(f"    검산 {normal_only}+{mixed}+{cancel_only}+{multi_other} = {parts:,}"
+          f" (행 둘 이상인 키 {multi:,})"
+          + ("" if parts == multi else "   <- 불일치. 분류 조건에 구멍"))
+    print()
+
+    print(f"  지워지는 행의 성격 (자연키 밖 칸까지 비교)")
+    print(f"    대상: 정상 행이 2개 이상인 키 {shape_base:,}"
+          f"   (정상만 여러 건 {normal_only:,} + 정상2이상+해제 {amb:,})")
+    for c, label, note in (("identical", "전 칸이 동일",       "손실 없음"),
+                           ("subset",    "빈 값 vs 채워진 값", "채워진 행을 남기면 손실 없음"),
+                           ("conflict",  "값이 서로 충돌",     "실제 손실 후보")):
+        print(f"    - {label:18s} : {shape[c]:,}키 / 지워지는 행 {shape_rows[c] - shape[c]:,}"
+              f"   <- {note}")
+    if conflict_fields:
+        print(f"      충돌 칸: {dict(conflict_fields.most_common())}")
+    shape_sum = sum(shape.values())
+    print(f"    검산 {shape['identical']}+{shape['subset']}+{shape['conflict']} = {shape_sum:,}"
+          f" (대상 {shape_base:,})"
+          + ("" if shape_sum == shape_base else "   <- 불일치. 분류 조건에 구멍"))
+    print()
+
+    # 전월세는 cdealType 필드 자체가 없음. 0을 찍으면 '해제가 없다'로 잘못 읽힘
+    if kind == "trade":
+        print(f"  해제 단독건 (정상0 + 해제1)  : {cancel_single:,}")
+        print(f"  정상 2 이상 + 해제 있음      : {amb:,}   <- 해제 대상 식별 불가")
+        print(f"  cdealType 이 O 도 빈 값도 아닌 행이 낀 키 : {unknown_any:,}   "
+              f"<- 0 이 아니면 판정 규칙 재검토")
+        print()
+
+    # trade_count=0 (전 행 unknown)인 키는 합계와 분모 양쪽에서 제외
+    counted  = sum(1 for s in stats.values() if s["trade_count"] > 0)
+    total_tc = sum(s["trade_count"] for s in stats.values())
+    label = "trade_count" if kind == "trade" else "계약건수"
+    print(f"  {label} 합계            : {total_tc:,}   (판정 가능한 키 {counted:,}개 기준)")
+    print(f"  {label} 분포            : "
+          f"{dict(sorted(collections.Counter(s['trade_count'] for s in stats.values()).items()))}")
+    # 이 설계의 실익 측정. 작으면 설계 반대 근거로도 사용
+    print(f"  중복을 버렸다면 사라질 건수  : {total_tc - counted:,}건")
+
+    if kind != "trade":
+        return
+    shown = 0
+    for k, g in buckets.items():
+        if shown >= 5:
+            break
+        if not stats[k]["ambiguous_cancel"]:
+            continue
+        print(f"\n  [식별 불가 샘플] 키={k}")
+        for r in g:
+            print(f"    해제={r.get('cdealType','')!r} 동={r.get('aptDong','')!r} "
+                  f"등기={r.get('rgstDate','')!r} 해제일={r.get('cdealDay','')!r} "
+                  f"금액={r.get('dealAmount','')!r} 출처={r.get('_source_file','')!r}")
+        shown += 1
+
+
+def audit_amount_tracking():
+    """후보 B(금액 제외) 감사. 목적은 채택 여부가 아니라 정정 추적 가능성.
+
+    측정 대상: 같은 base 키에 묶였으나 금액이 서로 다른 그룹
+
+    해석 주의
+      - '정정'으로 단정 불가. '금액이 다른 복수 거래'와 구분할 근거가 원본에 없음
+      - 개수만 측정, 판단은 사람
+
+    그룹 성격 분해
+      - 정상만     -> 신고 금액 정정 가능성
+      - 해제 섞임   -> 해제 통지의 금액 불일치 가능성
+      - 다수 쪽이 금액 변경 이력 설계를 좌우
+
+    위 [금액 포함] 절과는 키가 달라 숫자 비교 불가
+    """
+    rows, _ = _load_rows("trade")
+    if rows is None:
+        return
+
+    buckets, dropped = _bucket(rows, KEY_TRADE_BASE)
+
+    diff_amount, missing_amount = [], 0
+    for k, g in buckets.items():
+        amounts, blank = set(), 0
+        for r in g:
+            a = (r.get("dealAmount") or "").replace(",", "").strip()
+            if a:
+                amounts.add(a)
+            else:
+                blank += 1
+        if len(amounts) > 1:
+            diff_amount.append((k, g, amounts))
+        if amounts and blank:
+            missing_amount += 1
+
+    dup = sum(1 for g in buckets.values() if len(g) > 1)
+
+    # if/elif/else 3갈래 분류. 합은 구조상 diff_amount와 항상 같아 검산 대상 아님
+    pat_normal = pat_cancel = pat_unknown = pat_amb = 0
+    for _, g, _ in diff_amount:
+        s = summarize(g)
+        if s["unknown"]:
+            pat_unknown += 1
+        elif s["cancel"]:
+            pat_cancel += 1
+            if s["ambiguous_cancel"]:
+                pat_amb += 1
+        else:
+            pat_normal += 1
+
+    print(f"\n[trade / 금액 제외] 총 {len(rows):,}행")
+    _print_dropped(dropped, len(rows))
+    print(f"  고유 키                      : {len(buckets):,}")
+    print(f"  중복 그룹                    : {dup:,}")
+    print(f"  금액이 실제로 다른 그룹      : {len(diff_amount):,}   <- 정정 후보")
+    print(f"    이 그룹들의 성격 (금액 제외 키 기준. 위 절과 비교 불가)")
+    print(f"      - 해제 없이 정상만       : {pat_normal:,}   <- 신고 금액 정정 쪽")
+    print(f"      - 해제가 섞여 있음       : {pat_cancel:,}   <- 해제 통지 금액 불일치 쪽")
+    print(f"          그중 정상 2 이상     : {pat_amb:,}")
+    print(f"      - unknown 섞임           : {pat_unknown:,}")
+    print(f"  금액 결측과 값이 함께 있는 그룹: {missing_amount:,}   "
+          f"<- 정정 아님. 데이터 품질 이상")
+
+    for k, g, amounts in diff_amount[:5]:
+        print(f"\n  [금액 상이 샘플] 키={k}")
+        print(f"    금액 집합={sorted(amounts, key=_amount_sort_key)}")
+        for r in g:
+            print(f"    금액={r.get('dealAmount','')!r} 해제={r.get('cdealType','')!r} "
+                  f"해제일={r.get('cdealDay','')!r} 동={r.get('aptDong','')!r} "
+                  f"등기={r.get('rgstDate','')!r} 출처={r.get('_source_file','')!r}")
+
+
+def audit_fields(kind="trade"):
+    """컬럼별 실제 형식과 채움 상태 측정. 스키마 타입 결정 근거."""
+    rows, _ = _load_rows(kind)
+    if rows is None:
+        return
+
+    fields = (("cdealType", "cdealDay", "rgstDate", "dealingGbn",
+               "aptDong", "umdCd", "landLeaseholdGbn")
+              if kind == "trade" else
+              # 전월세 응답은 일부 필드가 소문자. roadNm 아님
+              # jibun: 매매의 bonbun/bubun 과 다른 규칙. 단일 필드 + zero-pad 없음
+              #   - 미매칭 단지 지오코딩에서 매매/전월세 정규화를 따로 써야 하는 근거
+              # monthlyRent: 자연키 구성 칸. _BLANK_DEFAULT 가 걸린 유일한 칸이라 빈값 수를 본다
+              ("contractType", "contractTerm", "preDeposit",
+               "preMonthlyRent", "useRRRight", "roadnm", "umdNm", "jibun",
+               "monthlyRent"))
+
+    print(f"\n[{kind}] 필드 실제 형식")
+    print(f"  {'필드':20s} {'태그없음':>8s} {'빈값':>8s} {'채워짐':>8s}   예시")
+    for f in fields:
+        # 태그없음 > 0 -> 원본 스키마 변경. 결측 해석 규칙 전체 재검토 대상
+        absent = sum(1 for r in rows if f not in r)
+        blank  = sum(1 for r in rows if f in r and not r[f])
+        filled = [r[f] for r in rows if r.get(f)]
+        print(f"  {f:20s} {absent:8,d} {blank:8,d} {len(filled):8,d}   {filled[:3]}")
+
+    floors, bad_floor = [], []
+    for r in rows:
+        v = (r.get("floor") or "").strip()
+        if not v:
+            continue
+        try:
+            floors.append(int(v))
+        except ValueError:
+            bad_floor.append(v)
+    print(f"  floor 범위           : {min(floors) if floors else 'N/A'} ~ "
+          f"{max(floors) if floors else 'N/A'} / 파싱 실패 {len(bad_floor):,}건 {bad_floor[:5]}")
+
+    # 결측과 형식 오류를 나누는 기준은 _key_of와 동일. 합치면 원인별 대응이 갈리지 않음
+    amt_field = "dealAmount" if kind == "trade" else "deposit"
+    amt_blank = sum(1 for r in rows if not (r.get(amt_field) or "").strip())
+    amt_bad   = [r[amt_field] for r in rows
+                 if (r.get(amt_field) or "").strip()
+                 and not r[amt_field].replace(",", "").strip().isdigit()]
+    print(f"  {amt_field:12s} 결측 : {amt_blank:,}건 / 형식 오류 {len(amt_bad):,}건 {amt_bad[:5]}")
+
+    # 소수 5자리 이상 출현 -> numeric(9,4)로 원본 보존 불가
+    scales = collections.Counter()
+    for r in rows:
+        v = (r.get("excluUseAr") or "").strip()
+        if "." not in v:
+            continue
+        try:
+            Decimal(v)
+        except InvalidOperation:
+            continue
+        scales[len(v.split(".", 1)[1])] += 1
+    print(f"  excluUseAr 소수 자리수 분포: {dict(sorted(scales.items()))}   "
+          f"<- 5 이상이면 numeric(9,4) 재검토")
+
+    if kind == "trade":
+        # 불변식 검산: 한 파일 = 한 (구, 계약월)
+        #   - 불일치 > 0 -> DEAL_YMD = 계약월 전제 붕괴
+        #   - 1콜 = 1개월, 3개월 롤링 윈도우가 이 전제 위에 있음
+        # 계약월을 못 읽은 행은 불일치와 분리. 이상값 탐지 함수가 이상값에 죽으면 안됨
+        mismatch, bad_ym = 0, 0
+        for r in rows:
+            src = (r.get("_source_file") or "").split("_")
+            if len(src) < 2:
+                continue
+            try:
+                ym = f"{int(r['dealYear'])}{int(r['dealMonth']):02d}"
+            except (KeyError, ValueError):
+                bad_ym += 1
+                continue
+            if src[1] != ym:
+                mismatch += 1
+        print(f"  파일명 계약월과 행 계약월 불일치: {mismatch:,}건 "
+              f"/ 계약월 판독 불가 {bad_ym:,}건   <- 0 이 아니면 DEAL_YMD 전제 재검토")
+
+        # 두 칸의 동반 채움률. 동 정보 결측을 '등기 전'으로 설명할 수 있는지 판단 근거
+        both = sum(1 for r in rows if r.get("aptDong") and r.get("rgstDate"))
+        dong = sum(1 for r in rows if r.get("aptDong"))
+        rgst = sum(1 for r in rows if r.get("rgstDate"))
+        print(f"  aptDong 과 rgstDate 동반 채움: {both:,} / 동 {dong:,} / 등기 {rgst:,}")
+
 
 if __name__ == "__main__":
+
+    # 매매:   python3 scripts/recon.py --audit-key
+    # 전월세: python3 scripts/recon.py --audit-key --rent
+    if "--audit-key" in sys.argv:
+        kind = "rent" if "--rent" in sys.argv else "trade"
+        audit_natural_key(kind)
+        if kind == "trade":
+            audit_amount_tracking()   # 금액 제외 키. 전월세는 dealAmount 자체가 없음
+        audit_fields(kind)
+        sys.exit(0)
+
     if "--report-only" in sys.argv:
         preflight(need_key=False)
     else:
-        print(f"수집 시작: {SIGUNGU}({LAWD_CD})  {START_YM}~{END_YM}\n")
+        print(
+            f"수집 시작: {SIGUNGU}({LAWD_CD}) "
+            f"{START_YM}~{END_YM}\n"
+        )
         collect(preflight())
         print()
+
     report()
