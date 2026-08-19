@@ -1,6 +1,7 @@
 """국토교통부 아파트 실거래 수집기.
 
-응답을 받아 파싱, 같은 응답 안의 중복 합치기, Supabase 적재, 이어하기까지
+응답을 받아 파싱, 같은 응답 안의 중복 합치기, Supabase 적재, 이어하기,
+응답에서 빠진 행 표시(is_current), 넣은/고친/안바뀐 수 기록까지
 
 전제
     자연키    trade (apt_seq, deal_date, exclu_use_ar, floor, deal_amount)
@@ -10,6 +11,8 @@
     payload   docs/data/schema.md 의 컬럼 목록과 정확히 같아야 함
     DB 준비   빈 값 보호 트리거(trg_trade_keep_filled, trg_rent_keep_filled)가
               먼저 적용돼 있어야 함. 없으면 빈 값이 이미 채워진 값을 지움
+              deal_change_log.run_id 연결(supabase/migrations/*_run_id_from_header.sql)은
+              없어도 나머지 기능은 그대로 동작함
 
 실행
     export DATA_GO_KR_KEY='디코딩_서비스키'
@@ -547,12 +550,15 @@ def _sb_config() -> tuple:
     return url.rstrip("/"), key
 
 
-def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, prefer=None):
+def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, prefer=None,
+                 extra_headers=None):
     """PostgREST 요청 한 번. 응답 본문이 있으면 그 값을, 없으면 None 을 돌려줌.
 
     실패한 응답의 본문까지 읽어서 SupabaseError 에 담는 이유
       - PostgREST 는 왜 막혔는지를 본문에 적어줌 (권한 문제면 필요한 GRANT 문까지)
       - 본문을 버리면 원인을 알 방법이 없음
+
+    extra_headers 는 X-Run-Id 처럼 요청마다 달라지는 헤더용
     """
     headers = {
         "apikey": sb_key,
@@ -561,6 +567,8 @@ def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, pre
     }
     if prefer:
         headers["Prefer"] = prefer
+    if extra_headers:
+        headers.update(extra_headers)
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     req = Request(f"{sb_url}/rest/v1/{path}", data=data, headers=headers, method=method)
     try:
@@ -576,13 +584,16 @@ def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, pre
     return json.loads(raw) if raw else None
 
 
-def upsert(table: str, rows: list, key_fields: tuple, cfg: CollectConfig) -> int:
+def upsert(table: str, rows: list, key_fields: tuple, cfg: CollectConfig, run_id=None) -> int:
     """자연키 기준으로 넣거나 고침. UPSERT_CHUNK 개씩 나눠 보냄.
 
     on_conflict 값이 unique 인덱스의 컬럼 목록과 글자까지 같아야 하는 이유
       - 다르면 PostgREST 가 42P10 으로 거부
     return=minimal 을 쓰는 이유
       - 넣은 행을 그대로 돌려받을 필요가 없음. 응답만 커짐
+    X-Run-Id 헤더를 붙이는 이유
+      - log_deal_change 트리거가 이 헤더를 읽어 deal_change_log.run_id 를 채움
+      - run_id 가 없으면(=start_run 실패) 헤더도 안 붙임. 트리거가 빈 값으로 처리함
     """
     if not rows:
         return 0
@@ -590,11 +601,12 @@ def upsert(table: str, rows: list, key_fields: tuple, cfg: CollectConfig) -> int
         return len(rows)
 
     path = f"{table}?on_conflict={','.join(key_fields)}"
+    headers = {"X-Run-Id": str(run_id)} if run_id is not None else None
     sent = 0
     for i in range(0, len(rows), UPSERT_CHUNK):
         chunk = rows[i:i + UPSERT_CHUNK]
         _sb_request("POST", path, cfg.sb_url, cfg.sb_key, body=chunk,
-                    prefer="resolution=merge-duplicates,return=minimal")
+                    prefer="resolution=merge-duplicates,return=minimal", extra_headers=headers)
         sent += len(chunk)
     return sent
 
@@ -665,6 +677,68 @@ def done_today(kind: str, cfg: CollectConfig) -> set:
     return {(r["lawd_cd"], r["deal_ym"]) for r in rows}
 
 
+def _sb_count(path: str, cfg: CollectConfig) -> int:
+    """HEAD 로 물어서 행 수만 얻음. 본문이 아니라 Content-Range 헤더를 읽음.
+
+    _sb_request 를 그대로 못 쓰는 이유
+      - _sb_request 는 본문을 읽는데, HEAD 응답은 본문이 없고 헤더에만 개수가 있음
+    """
+    req = Request(f"{cfg.sb_url}/rest/v1/{path}", headers={
+        "apikey": cfg.sb_key,
+        "Authorization": f"Bearer {cfg.sb_key}",
+        "Prefer": "count=exact",
+    }, method="HEAD")
+    try:
+        with urlopen(req, timeout=TIMEOUT_SEC) as resp:
+            header = resp.headers.get("Content-Range", "")
+    except HTTPError as e:
+        raise SupabaseError(e.code, e.read().decode("utf-8", errors="replace")) from None
+    except (URLError, TimeoutError, OSError) as e:
+        raise SupabaseError(0, str(e)) from None
+    # 모양은 '0-24/148'. 0건이면 '*/0'
+    total = header.rsplit("/", 1)[-1] if "/" in header else ""
+    if not total.isdigit():
+        # 읽지 못하면 0 이 아니라 예외
+        #   - 0 을 돌려주면 '표가 비어 있음' 과 구분이 안 됨
+        #   - 그러면 넣은/고친 수가 전부 0 으로 나와 '변화 없음' 처럼 보임
+        #   - 세는 기능이 통째로 죽어도 로그는 멀쩡해 보이게 됨
+        raise SupabaseError(0, f"Content-Range 를 읽지 못함: {header!r}")
+    return int(total)
+
+
+def _max_log_id(cfg: CollectConfig) -> int:
+    """deal_change_log 의 가장 큰 id. 비어 있으면 0."""
+    rows = _sb_request("GET", "deal_change_log?select=id&order=id.desc&limit=1",
+                        cfg.sb_url, cfg.sb_key) or []
+    return rows[0]["id"] if rows else 0
+
+
+def mark_stale(kind: str, lawd_cd: str, deal_ym: str, seen_at: str, cfg: CollectConfig,
+                run_id=None) -> int:
+    """이번 응답에 없던 행을 is_current=false 로 표시. 지우지 않음.
+
+    last_seen_at 이 seen_at 보다 이른 행만 고르는 이유
+      - seen_at 은 collect_one 이 이번 응답을 받기 전에 만든 값
+      - 이번에 upsert 한 행은 last_seen_at 이 정확히 seen_at 이라 lt 조건에 안 걸림
+      - 즉 이번에 안 들어온 행만 골라짐
+
+    seen_at 을 quote() 로 감싸는 이유
+      - '2026-08-20T05:12:33+00:00' 의 + 를 그대로 URL 에 넣으면 공백으로 읽힘
+      - done_today 가 오늘 날짜를 넣을 때도 같은 문제라 같은 방식으로 감쌈
+
+    예외를 여기서 잡지 않는 이유
+      - 적재는 됐는데 마킹만 실패한 것도 실패로 봐야 함. main 이 판단하게 그대로 올림
+    """
+    if cfg.dry_run:
+        return 0
+    path = (f"{kind}?sgg_cd=eq.{lawd_cd}&deal_ym=eq.{deal_ym}"
+            f"&last_seen_at=lt.{quote(seen_at, safe='')}&is_current=is.true&select=id")
+    headers = {"X-Run-Id": str(run_id)} if run_id is not None else None
+    resp = _sb_request("PATCH", path, cfg.sb_url, cfg.sb_key, body={"is_current": False},
+                        prefer="return=representation", extra_headers=headers)
+    return len(resp) if resp else 0
+
+
 def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> ET.Element:
     """한 페이지를 받아옴. 네트워크 오류만 다시 시도.
 
@@ -694,8 +768,9 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
     raise ApiError("", f"{MAX_RETRY}회 다시 시도했지만 실패: {last_err}") from last_err
 
 
-def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig) -> dict:
-    """구 하나의 계약월 하나를 받아 파싱하고 합치는 데까지.
+def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig,
+                 run_id=None, progress: str = "") -> dict:
+    """구 하나의 계약월 하나를 받아 파싱, 합치기, 적재, 넣은/고친/안바뀐 수 계산, 마킹까지.
 
     전체 건수(totalCount)로 페이지 수를 먼저 계산하는 이유
       - 파서가 자연키를 못 만든 행을 걸러내서, 받은 행 수와 전체 건수가 다를 수 있음
@@ -716,11 +791,48 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig) -> di
         all_rows.extend(parser(p_root, lawd_cd, seen_at))
 
     merged, collapsed, amb, conflicts = merge_batch(all_rows, key_fields)
-    sent = upsert(kind, merged, key_fields, cfg)   # kind 가 곧 테이블 이름 (trade / rent)
+
+    # 넣은/고친 수는 PostgREST 가 안 알려줘서 앞뒤로 재서 계산
+    #   - 이 구간에 같은 (kind, 구, 계약월) 을 두 번째로 돌리는 프로세스가 없다는 게 전제
+    #   - 동시 실행 차단은 GitHub Actions concurrency 그룹이 맡음(이 파일의 일이 아님)
+    count_path = f"{kind}?sgg_cd=eq.{lawd_cd}&deal_ym=eq.{deal_ym}&select=id"
+    inserted = updated = unchanged = marked = 0
+    before_rows = before_log_id = 0
+    if not cfg.dry_run:
+        before_rows = _sb_count(count_path, cfg)
+        before_log_id = _max_log_id(cfg)
+
+    sent = upsert(kind, merged, key_fields, cfg, run_id=run_id)   # kind 가 곧 테이블 이름
+
+    if not cfg.dry_run:
+        after_rows = _sb_count(count_path, cfg)
+        changed = _sb_count(f"deal_change_log?id=gt.{before_log_id}&select=id", cfg)
+        inserted, updated = after_rows - before_rows, changed
+        # 음수 보정을 unchanged 계산보다 먼저
+        #   - 나중에 하면 unchanged 가 음수 inserted 로 계산돼 셋의 합이 안 맞음
+        if inserted < 0:
+            print(f"  [경고] {kind} {lawd_cd} {deal_ym}: 넣은 수가 음수({inserted}) -> 0 처리. "
+                  f"누군가 행을 지웠을 수 있음")
+            inserted = 0
+        unchanged = len(merged) - inserted - updated
+        if unchanged < 0:
+            print(f"  [경고] {kind} {lawd_cd} {deal_ym}: 안 바뀐 수가 음수({unchanged}) -> 0 처리")
+            unchanged = 0
+
+        # 마킹은 카운트 계산 뒤에
+        #   - 마킹도 이력을 만듦
+        #   - 먼저 하면 사라진 행이 '고친 수' 에 섞임
+        # 합친 행이 0개면 마킹 안 함
+        #   - API 가 일시적으로 0건을 주면 그 달 전체가 한 번에 false 로 뒤집힘
+        if merged:
+            marked = mark_stale(kind, lawd_cd, deal_ym, seen_at, cfg, run_id=run_id)
 
     # dry-run 은 실제로 보내지 않았으므로 sent 를 숫자로 찍지 않음
-    sent_txt = "적재 안함" if cfg.dry_run else f"sent={sent:>5}"
-    line = (f"  {kind:5s} {lawd_cd} {deal_ym}: totalCount={total:>5} page={pages:>2}  "
+    if cfg.dry_run:
+        sent_txt = "적재 안함"
+    else:
+        sent_txt = f"sent={sent:>5} in={inserted} up={updated} same={unchanged} stale={marked}"
+    line = (f"  {progress}{kind:5s} {lawd_cd} {deal_ym}: totalCount={total:>5} page={pages:>2}  "
             f"parsed={len(all_rows):>5} merged={len(merged):>5} {sent_txt} "
             f"collapsed={collapsed:>3} ambiguous_cancel={amb}")
     if conflicts:
@@ -732,6 +844,8 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig) -> di
         "total_count": total, "page_count": pages,
         "parsed_rows": len(all_rows), "merged_rows": len(merged), "fetched_rows": sent,
         "collapsed": collapsed, "ambiguous_cancel": amb, "conflicts": conflicts,
+        "inserted_count": inserted, "updated_count": updated, "unchanged_count": unchanged,
+        "marked_stale": marked,
         "rows": merged,
     }
 
@@ -755,12 +869,16 @@ def _resolve_districts(spec: str) -> list:
 
 def _resolve_months(args) -> list:
     if args.preset:
-        return PRESETS[args.preset]()
-    if args.recent_months:
-        return months_back(args.recent_months, skip=1)
-    if args.months:
-        return month_range(args.months)
-    sys.exit("[중단] --months / --recent-months / --preset 중 하나가 필요합니다.")
+        months = PRESETS[args.preset]()
+    elif args.recent_months:
+        months = months_back(args.recent_months, skip=1)
+    elif args.months:
+        months = month_range(args.months)
+    else:
+        sys.exit("[중단] --months / --recent-months / --preset 중 하나가 필요합니다.")
+    # preset 처럼 두 구간을 이어붙이면 겹칠 수 있음
+    #   - 겹친 채로 두면 같은 달을 두 번 호출해 API 한도만 씀
+    return sorted(set(months))
 
 
 def _get_key() -> str:
@@ -799,6 +917,7 @@ def main():
     parsed_total = merged_total = 0
     failed = []
     printed_keys = set()
+    idx = 0   # 건너뛴 것도 세야 [12/150] 같은 진행률이 끝까지 맞음
     try:
         for kind in kinds:
             skip = set()
@@ -808,12 +927,15 @@ def main():
 
             for lawd_cd in districts:
                 for deal_ym in months:
+                    idx += 1
                     if (lawd_cd, deal_ym) in skip:
                         continue
+                    progress = f"[{idx:>3}/{n_calls:>3}] "
 
                     run_id = start_run(kind, lawd_cd, deal_ym, cfg)
                     try:
-                        result = collect_one(kind, lawd_cd, deal_ym, cfg)
+                        result = collect_one(kind, lawd_cd, deal_ym, cfg,
+                                              run_id=run_id, progress=progress)
                     except FatalApiError as e:
                         finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
                                    error_code=e.code, error_msg=str(e))
@@ -823,7 +945,7 @@ def main():
                         finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
                                    error_code=e.code, error_msg=str(e))
                         failed.append((kind, lawd_cd, deal_ym, str(e)))
-                        print(f"  {kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
+                        print(f"  {progress}{kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
                         continue
                     except SupabaseError as e:
                         finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
@@ -832,13 +954,16 @@ def main():
                             # 키나 권한이 잘못된 것. 남은 요청도 다 같은 이유로 막히니 전체 중단
                             raise FatalApiError(str(e.status), "Supabase 인증/권한 오류") from e
                         failed.append((kind, lawd_cd, deal_ym, str(e)))
-                        print(f"  {kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
+                        print(f"  {progress}{kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
                         continue
 
                     finish_run(run_id, "ok", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
                                total_count=result["total_count"],
                                fetched_rows=result["fetched_rows"],
-                               page_count=result["page_count"])
+                               page_count=result["page_count"],
+                               inserted_count=result["inserted_count"],
+                               updated_count=result["updated_count"],
+                               unchanged_count=result["unchanged_count"])
                     parsed_total += result["parsed_rows"]
                     merged_total += result["merged_rows"]
                     if kind not in printed_keys and result["rows"]:
