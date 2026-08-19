@@ -1,6 +1,6 @@
 """국토교통부 아파트 실거래 수집기.
 
-응답을 받아 파싱하고, 같은 응답 안의 중복을 합치는 데까지. DB 적재는 아직 없음
+응답을 받아 파싱, 같은 응답 안의 중복 합치기, Supabase 적재, 이어하기까지
 
 전제
     자연키    trade (apt_seq, deal_date, exclu_use_ar, floor, deal_amount)
@@ -8,11 +8,18 @@
     정규화    면적 반올림과 월세 결측 처리는 scripts/recon.py 와 같은 규칙이어야 함
               두 파일의 규칙이 달라지면 recon.py 로 센 숫자와 DB 행 수가 어긋남
     payload   docs/data/schema.md 의 컬럼 목록과 정확히 같아야 함
+    DB 준비   빈 값 보호 트리거(trg_trade_keep_filled, trg_rent_keep_filled)가
+              먼저 적용돼 있어야 함. 없으면 빈 값이 이미 채워진 값을 지움
 
 실행
     export DATA_GO_KR_KEY='디코딩_서비스키'
-    python3 scripts/collect.py --kind trade --districts 11680 --months 202607 --dry-run
-    python3 scripts/collect.py --kind trade --months 202607 --dry-run
+
+    DB 없이 건수만 확인
+        python3 scripts/collect.py --kind trade --districts 11680 --months 202607 --dry-run
+
+    실제 적재 (Supabase 접속 정보가 추가로 필요)
+        set -a; source .env; set +a
+        python3 scripts/collect.py --kind trade --districts 11680 --months 202607
 
     서비스키는 디코딩 키를 쓸 것
       - urlencode() 가 키를 한 번 더 인코딩함
@@ -30,9 +37,9 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from urllib.error import URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -50,6 +57,10 @@ NUM_OF_ROWS  = 1000          # 지정하지 않으면 10건씩만 옴
 THROTTLE_SEC = 0.2           # 초당 30건까지 허용. 5건으로 여유를 둠
 MAX_RETRY    = 3
 TIMEOUT_SEC  = 30
+# 한 번에 보낼 행 수
+#   - 너무 크면 요청 본문이 커짐
+#   - 한 묶음이 실패했을 때 다시 보내야 할 양도 커짐
+UPSERT_CHUNK = 500
 
 AREA_SCALE = Decimal("0.0001")   # exclu_use_ar 컬럼이 numeric(9,4) 라 소수 넷째 자리까지
 
@@ -83,6 +94,20 @@ class FatalApiError(ApiError):
     예외 메시지 대신 클래스로 구분하는 이유
       - 메시지 글자를 보고 재시도 여부를 정하면, 문구를 고치는 순간 판단이 틀어짐
     """
+
+
+class SupabaseError(RuntimeError):
+    """Supabase(PostgREST) 요청이 실패함. status 로 전체 중단 여부를 정함.
+
+    401, 403 이면 키나 권한이 잘못된 것
+      - 남은 요청도 같은 이유로 다 막히니 전체 중단
+      - 그 밖의 status 는 이 (구, 계약월) 하나만 실패로 두고 다음으로 넘어감
+    """
+
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"status={status} {detail}")
 
 
 # ============================== 기간 ==============================
@@ -500,8 +525,144 @@ def merge_batch(rows: list, key_fields: tuple) -> tuple:
 # ============================== 수집 ==============================
 @dataclass
 class CollectConfig:
-    key: str
+    key: str                 # data.go.kr 서비스키
     dry_run: bool = True
+    sb_url: str = ""
+    sb_key: str = ""
+
+
+def _sb_config() -> tuple:
+    """환경변수에서 Supabase 접속 정보를 읽음. dry-run 이면 부르지 않음.
+
+    SUPABASE_URL 이 없으면 NEXT_PUBLIC_SUPABASE_URL 을 대신 봄
+      - 지금 .env 에는 NEXT_PUBLIC_ 쪽만 있음
+    ANON_KEY 가 아니라 SERVICE_ROLE_KEY 만 쓰는 이유
+      - ANON_KEY 로는 RLS 에 막혀 쓰기가 안 됨
+    """
+    url = (os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL") or "").strip()
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        sys.exit("[중단] Supabase 접속 정보가 없습니다. SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY 를 확인하세요.\n"
+                 "       set -a; source .env; set +a")
+    return url.rstrip("/"), key
+
+
+def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, prefer=None):
+    """PostgREST 요청 한 번. 응답 본문이 있으면 그 값을, 없으면 None 을 돌려줌.
+
+    실패한 응답의 본문까지 읽어서 SupabaseError 에 담는 이유
+      - PostgREST 는 왜 막혔는지를 본문에 적어줌 (권한 문제면 필요한 GRANT 문까지)
+      - 본문을 버리면 원인을 알 방법이 없음
+    """
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    req = Request(f"{sb_url}/rest/v1/{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=TIMEOUT_SEC) as resp:
+            raw = resp.read()
+    except HTTPError as e:
+        raise SupabaseError(e.code, e.read().decode("utf-8", errors="replace")) from None
+    except (URLError, TimeoutError, OSError) as e:
+        # HTTPError 가 아닌 통신 오류(타임아웃, DNS 실패 등)도 SupabaseError 로 통일
+        #   - start_run / finish_run / done_today 가 "예외를 밖으로 안 낸다"고 약속하는데
+        #     여기서 새어나가면 그 약속이 깨짐
+        raise SupabaseError(0, str(e)) from None
+    return json.loads(raw) if raw else None
+
+
+def upsert(table: str, rows: list, key_fields: tuple, cfg: CollectConfig) -> int:
+    """자연키 기준으로 넣거나 고침. UPSERT_CHUNK 개씩 나눠 보냄.
+
+    on_conflict 값이 unique 인덱스의 컬럼 목록과 글자까지 같아야 하는 이유
+      - 다르면 PostgREST 가 42P10 으로 거부
+    return=minimal 을 쓰는 이유
+      - 넣은 행을 그대로 돌려받을 필요가 없음. 응답만 커짐
+    """
+    if not rows:
+        return 0
+    if cfg.dry_run:
+        return len(rows)
+
+    path = f"{table}?on_conflict={','.join(key_fields)}"
+    sent = 0
+    for i in range(0, len(rows), UPSERT_CHUNK):
+        chunk = rows[i:i + UPSERT_CHUNK]
+        _sb_request("POST", path, cfg.sb_url, cfg.sb_key, body=chunk,
+                    prefer="resolution=merge-duplicates,return=minimal")
+        sent += len(chunk)
+    return sent
+
+
+def start_run(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig):
+    """수집을 시작할 때 기록을 먼저 남김. 실패해도 예외 없이 None 을 돌려줌.
+
+    끝난 뒤에만 기록하면, 중간에 죽었을 때 시도했다는 흔적조차 안 남음
+      - status='running' 인 채로 남은 행이 '여기서 죽었다' 는 표시가 됨
+    """
+    if cfg.dry_run:
+        return None
+    body = [{
+        "kind": kind, "lawd_cd": lawd_cd, "deal_ym": deal_ym,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }]
+    try:
+        resp = _sb_request("POST", "collect_run", cfg.sb_url, cfg.sb_key,
+                            body=body, prefer="return=representation")
+        return resp[0]["id"]
+    except SupabaseError as e:
+        print(f"  [경고] collect_run 시작 기록 실패: {e}")
+        return None
+
+
+def finish_run(run_id, status: str, cfg: CollectConfig, **fields):
+    """collect_run 행 하나를 마무리 상태로 고침.
+
+    run_id 가 없으면(=start_run 이 실패했으면) 새 행을 만들어서라도 남김
+      - 이때 kind, lawd_cd, deal_ym 이 fields 에 없으면 NOT NULL 위반으로 이 기록마저 사라짐
+      - 부르는 쪽(main)이 실패를 대비해 항상 같이 넘겨줌
+    실패해도 예외를 밖으로 내지 않음. 기록이 실패했다고 수집 결과까지 버릴 이유는 없음
+    """
+    if cfg.dry_run:
+        return
+    if fields.get("error_msg"):
+        fields["error_msg"] = fields["error_msg"][:500]
+    body = {"status": status, "finished_at": datetime.now(timezone.utc).isoformat(), **fields}
+    try:
+        if run_id is None:
+            _sb_request("POST", "collect_run", cfg.sb_url, cfg.sb_key,
+                        body=[body], prefer="return=minimal")
+        else:
+            _sb_request("PATCH", f"collect_run?id=eq.{run_id}", cfg.sb_url, cfg.sb_key,
+                        body=body, prefer="return=minimal")
+    except SupabaseError as e:
+        print(f"  [경고] collect_run 종료 기록 실패: {e}")
+
+
+def done_today(kind: str, cfg: CollectConfig) -> set:
+    """오늘 이미 성공한 (구, 계약월) 조합. dry-run 이거나 --no-resume 이면 부르지 않음.
+
+    읽기에 실패하면 빈 set (건너뛰는 것보다 다시 받는 편이 안전)
+    '오늘' 로 자르는 이유
+      - 어제 성공했어도 오늘 새로 신고된 거래가 있을 수 있음
+    """
+    if cfg.dry_run:
+        return set()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+    path = (f"collect_run?select=lawd_cd,deal_ym&kind=eq.{kind}"
+            f"&status=eq.ok&started_at=gte.{quote(today, safe='')}")
+    try:
+        rows = _sb_request("GET", path, cfg.sb_url, cfg.sb_key) or []
+    except SupabaseError as e:
+        print(f"  [경고] {kind} 완료 목록 조회 실패: {e}")
+        return set()
+    return {(r["lawd_cd"], r["deal_ym"]) for r in rows}
 
 
 def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> ET.Element:
@@ -509,6 +670,11 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
 
     다시 시도할 때마다 대기 시간을 두 배로 늘림 (0.2초, 0.4초, 0.8초)
     응답 코드 오류는 check_error 가 바로 예외를 내므로 이 재시도를 타지 않음
+
+    재시도를 다 쓰면 ApiError 로 바꿔서 던지는 이유
+      - 통신 오류를 그대로 올리면 main 이 못 잡아 전체 실행이 멈춤
+      - 그러면 collect_run 에 running 인 행이 그대로 남고 실패 목록에도 안 잡힘
+      - 이 (구, 계약월) 하나만 실패로 두고 나머지는 계속 받게 함
     """
     last_err = None
     for attempt in range(MAX_RETRY):
@@ -525,7 +691,7 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
             raise ApiError("", f"XML 이 아닌 응답 {body[:200]!r}") from None
         check_error(root)
         return root
-    raise last_err
+    raise ApiError("", f"{MAX_RETRY}회 다시 시도했지만 실패: {last_err}") from last_err
 
 
 def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig) -> dict:
@@ -550,19 +716,21 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig) -> di
         all_rows.extend(parser(p_root, lawd_cd, seen_at))
 
     merged, collapsed, amb, conflicts = merge_batch(all_rows, key_fields)
+    sent = upsert(kind, merged, key_fields, cfg)   # kind 가 곧 테이블 이름 (trade / rent)
 
-    if cfg.dry_run:
-        line = (f"  {kind:5s} {lawd_cd} {deal_ym}: totalCount={total:>5} page={pages:>2}  "
-                f"parsed={len(all_rows):>5} merged={len(merged):>5} collapsed={collapsed:>3} "
-                f"ambiguous_cancel={amb}")
-        if conflicts:
-            line += f"  conflicts={conflicts}"
-        print(line)
+    # dry-run 은 실제로 보내지 않았으므로 sent 를 숫자로 찍지 않음
+    sent_txt = "적재 안함" if cfg.dry_run else f"sent={sent:>5}"
+    line = (f"  {kind:5s} {lawd_cd} {deal_ym}: totalCount={total:>5} page={pages:>2}  "
+            f"parsed={len(all_rows):>5} merged={len(merged):>5} {sent_txt} "
+            f"collapsed={collapsed:>3} ambiguous_cancel={amb}")
+    if conflicts:
+        line += f"  conflicts={conflicts}"
+    print(line)
 
     return {
         "kind": kind, "lawd_cd": lawd_cd, "deal_ym": deal_ym,
         "total_count": total, "page_count": pages,
-        "parsed_rows": len(all_rows), "merged_rows": len(merged),
+        "parsed_rows": len(all_rows), "merged_rows": len(merged), "fetched_rows": sent,
         "collapsed": collapsed, "ambiguous_cancel": amb, "conflicts": conflicts,
         "rows": merged,
     }
@@ -612,16 +780,17 @@ def main():
     ap.add_argument("--preset", choices=list(PRESETS))
     ap.add_argument("--districts", default="all", help="'all' 또는 '11680,11590'")
     ap.add_argument("--dry-run", action="store_true", help="DB 에 쓰지 않고 건수만 확인")
+    ap.add_argument("--no-resume", action="store_true", help="오늘 이미 성공한 것도 다시 받기")
     args = ap.parse_args()
-
-    if not args.dry_run:
-        sys.exit("[중단] DB 적재는 아직 구현되지 않았습니다. --dry-run 을 붙이세요.")
 
     key       = _get_key()
     months    = _resolve_months(args)
     districts = _resolve_districts(args.districts)
     kinds     = ("trade", "rent") if args.kind == "both" else (args.kind,)
-    cfg       = CollectConfig(key=key, dry_run=True)
+
+    cfg = CollectConfig(key=key, dry_run=args.dry_run)
+    if not args.dry_run:
+        cfg.sb_url, cfg.sb_key = _sb_config()
 
     n_calls = len(districts) * len(months) * len(kinds)
     print(f"수집 대상: kind={list(kinds)}  구 {len(districts)}개  월 {len(months)}개  "
@@ -632,17 +801,44 @@ def main():
     printed_keys = set()
     try:
         for kind in kinds:
+            skip = set()
+            if not cfg.dry_run and not args.no_resume:
+                skip = done_today(kind, cfg)
+                print(f"  {kind}: 오늘 이미 성공 {len(skip)}건 건너뜀")
+
             for lawd_cd in districts:
                 for deal_ym in months:
+                    if (lawd_cd, deal_ym) in skip:
+                        continue
+
+                    run_id = start_run(kind, lawd_cd, deal_ym, cfg)
                     try:
                         result = collect_one(kind, lawd_cd, deal_ym, cfg)
-                    except FatalApiError:
+                    except FatalApiError as e:
+                        finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
+                                   error_code=e.code, error_msg=str(e))
                         raise
                     except ApiError as e:
                         # 한 구가 실패해도 나머지는 계속 받고, 끝에 모아서 알려줌
+                        finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
+                                   error_code=e.code, error_msg=str(e))
                         failed.append((kind, lawd_cd, deal_ym, str(e)))
                         print(f"  {kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
                         continue
+                    except SupabaseError as e:
+                        finish_run(run_id, "error", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
+                                   error_code=str(e.status), error_msg=e.detail)
+                        if e.status in (401, 403):
+                            # 키나 권한이 잘못된 것. 남은 요청도 다 같은 이유로 막히니 전체 중단
+                            raise FatalApiError(str(e.status), "Supabase 인증/권한 오류") from e
+                        failed.append((kind, lawd_cd, deal_ym, str(e)))
+                        print(f"  {kind:5s} {lawd_cd} {deal_ym}: 실패 {e}")
+                        continue
+
+                    finish_run(run_id, "ok", cfg, kind=kind, lawd_cd=lawd_cd, deal_ym=deal_ym,
+                               total_count=result["total_count"],
+                               fetched_rows=result["fetched_rows"],
+                               page_count=result["page_count"])
                     parsed_total += result["parsed_rows"]
                     merged_total += result["merged_rows"]
                     if kind not in printed_keys and result["rows"]:
@@ -653,7 +849,7 @@ def main():
     except FatalApiError as e:
         sys.exit(f"[중단] {e}")
 
-    print(f"\ndry-run 총 파싱 {parsed_total:,}건 / 병합 {merged_total:,}건 "
+    print(f"\n총 파싱 {parsed_total:,}건 / 병합 {merged_total:,}건 "
           f"(병합분 {parsed_total - merged_total:,}건)")
 
     if failed:
