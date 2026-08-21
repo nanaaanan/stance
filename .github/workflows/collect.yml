@@ -1,12 +1,13 @@
 name: collect
 
 on:
-  # 수동 실행. 먼저 이것으로 검증한 뒤 아래 schedule 주석 해제
+  # 수동 실행. 스케줄과 별개로 언제든 재수집 가능
+  #   - 같은 UTC 날에 다시 누르면 done_today 가 성공분을 건너뜀
   workflow_dispatch:
   # Actions cron 은 항상 UTC. 20:17 UTC = 익일 05:17 KST
   #   - 정각은 스케줄 요청이 몰리는 시간대. 17분으로 회피
-  # schedule:
-  #   - cron: "17 20 * * *"
+  schedule:
+    - cron: "17 20 * * *"
 
 # permissions 명시 시 여기 없는 스코프는 전부 none
 #   - 저장소 기본값 상속을 끊는 목적
