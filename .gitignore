@@ -55,7 +55,7 @@ venv/
 # rest client env files(personal)
 http-client.private.env.json
 
-# temp
+# temp design/tech spec
 _spec.md
 
 # macOS
