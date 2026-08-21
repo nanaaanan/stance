@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  # required status check 는 PR head 에서 검사가 돌아야 등록됨
+  #   - 이 트리거를 빼면 머지 게이트로 지정하는 것 자체가 불가
+  pull_request:
+  # PR 을 거치지 않고 main 에 들어온 것도 검사 (keepalive 봇 커밋 포함)
+  push:
+    branches: [main]
+
+# permissions 명시 시 여기 없는 스코프는 전부 none
+#   - 소스를 읽기만 함. 쓰기 없음
+permissions:
+  contents: read
+
+# 새 커밋이 오면 이전 검사 결과는 낡은 코드에 대한 판정
+#   - collect.yml 은 cancel-in-progress: false. 반대인 것이 의도
+#   - 수집은 중간에 죽으면 그날 데이터가 비지만, 검사는 잃을 것이 없음
+# group 에 ref 를 붙이지 않으면 A 의 PR 검사가 B 의 PR 검사를 취소
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # job 이름이 곧 required status check 이름. 바꾸면 등록해 둔 게이트가 풀림
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 버전 고정의 근거는 재현성 하나
+    #   - 엔진이 바뀌면 코드를 안 고쳐도 게이트가 뒤집힘
+    #   - 도커 태그는 가변. 공급망 방어로는 성립하지 않음
+    #   - digest 고정은 안 함. Dependabot 이 없어 보안 패치가 영영 안 옴
+    container:
+      image: semgrep/semgrep:1.174.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # collect.yml 의 keepalive 는 true(기본값). 여기는 반대인 것이 의도
+          #   - 이후 인증이 필요한 git 명령이 없음
+          #   - 스캔이 제3자 컨테이너 안에서 돌고 체크아웃이 그 안에 마운트됨
+          persist-credentials: false
+
+      - name: Semgrep
+        # 명령을 둘로 나눈 이유. 한 줄로 합치면 안 됨
+        #   - --severity=ERROR 가 warn 레벨 스캔 오류까지 걸러 --strict 를 무력화
+        #   - 합치면 파싱 실패 탐지가 있는 것처럼 보이면서 실제로는 동작 안 함
+        # 건전성을 먼저 두는 이유
+        #   - 스캔이 온전히 안 돌았으면 게이트 결과 자체가 무의미
+        #   - run 의 기본 셸이 bash -e 라 첫 명령 실패 시 여기서 멈춤
+        run: |
+          # 1) 스캔 건전성 + 전수 보고
+          #    --quiet 없음: WARNING 을 로그에 남기는 것이 이 명령의 두 번째 역할
+          #    --severity 없음: 넣으면 파싱 실패를 못 잡음
+          semgrep scan \
+            --config=p/default --config=p/secrets \
+            --metrics=off \
+            --strict
+
+          # 2) 게이트
+          #    --error 없으면 지적이 있어도 종료코드 0. 게이트가 성립하지 않음
+          semgrep scan \
+            --config=p/default --config=p/secrets \
+            --metrics=off \
+            --severity=ERROR --error --quiet
