@@ -55,5 +55,8 @@ venv/
 # rest client env files(personal)
 http-client.private.env.json
 
+# temp
+_spec.md
+
 # macOS
 .DS_Store
