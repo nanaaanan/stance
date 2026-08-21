@@ -1,0 +1,88 @@
+name: collect
+
+on:
+  # 수동 실행. 먼저 이것으로 검증한 뒤 아래 schedule 주석 해제
+  workflow_dispatch:
+  # Actions cron 은 항상 UTC. 20:17 UTC = 익일 05:17 KST
+  #   - 정각은 스케줄 요청이 몰리는 시간대. 17분으로 회피
+  # schedule:
+  #   - cron: "17 20 * * *"
+
+# permissions 명시 시 여기 없는 스코프는 전부 none
+#   - 저장소 기본값 상속을 끊는 목적
+#   - 쓰기는 push 하는 job 에만 (keepalive)
+permissions:
+  contents: read
+
+# 이전 실행이 안 끝났으면 새 실행을 시작하지 않음
+#   - 잠금 위치는 DB 가 아니라 실행기 층
+#   - PostgREST 는 요청 1개 = 트랜잭션 1개 = 세션 1개. advisory lock 이 응답과 함께 풀림
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # collect.py 는 표준 라이브러리만 사용. pip install 스텝 불필요
+      - name: 최근 3개월 재수집
+        # 신고 기한이 계약일로부터 30일. 최근 1~2개월은 항상 과소집계
+        # 매일 같은 구간 재수신으로 신고 지연분 보충, 정정/해제 이력 축적
+        env:
+          # 시크릿은 env 로만 전달
+          #   - run: 줄의 인자는 러너 프로세스 목록에 노출
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/collect.py --recent-months 3
+
+  # 60일 무커밋 시 스케줄 워크플로가 자동 비활성화되는 것 방어
+  # collect 와 분리한 이유
+  #   - 실행 보장만이면 if: always() 로 충분
+  #   - 고유 이득은 신뢰 경계 분리. 외부 XML 을 파싱하는 수집 스텝에 쓰기 토큰을 쥐어주지 않음
+  # needs 없음
+  #   - 수집이 몇 주 연속 실패해도 60일 방어는 유지되어야 함
+  #   - 수집 실패는 워크플로 run 전체를 실패로 표시하므로 장애가 가려지지 않음
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # persist-credentials 기본값 true 유지
+      #   - 토큰이 .git/config 에 남아야 push 인증 가능
+      - uses: actions/checkout@v7
+      - name: 주 1회 last-run 갱신
+        run: |
+          set -euo pipefail
+
+          STAMP=data/last-run.txt
+          # 필요 최소치는 60일에 1커밋. 커밋 히스토리 오염을 피해 주 1회로 제한
+          INTERVAL=$((7 * 24 * 3600))
+          NOW=$(date -u +%s)
+
+          # 판정 불가는 전부 '갱신해야 함' 으로 처리 (fail-open)
+          #   - 파일 없음과 형식 깨짐을 같은 경로로 합침
+          #   - 커밋 1개가 더 생기는 비용 << keepalive 를 놓쳐 워크플로가 죽는 비용
+          PREV=""
+          if [ -f "$STAMP" ]; then
+            PREV=$(date -u -d "$(cat "$STAMP")" +%s 2>/dev/null || true)
+          fi
+
+          if [ -n "$PREV" ] && [ "$((NOW - PREV))" -lt "$INTERVAL" ]; then
+            echo "마지막 갱신 이후 $((NOW - PREV))초 경과. 7일 미만이므로 커밋 생략"
+            exit 0
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAMP"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STAMP"
+          git diff --staged --quiet || git commit -m "chore(data): update last-run timestamp"
+          git push
