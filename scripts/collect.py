@@ -163,8 +163,12 @@ PRESETS = {
 
 
 # ============================== HTTP ==============================
-def fetch(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> str:
-    """API 를 한 번 호출해 XML 원문을 돌려줌. 재시도는 부르는 쪽이 담당."""
+def fetch(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> tuple:
+    """API 를 한 번 호출해 (본문, 상태코드, Content-Type) 을 돌려줌. 재시도는 부르는 쪽이 담당.
+
+    본문만 돌려주지 않는 이유
+      - 파싱 실패 시 본문 대신 남길 진단 정보가 필요 (_fetch_page 참조)
+    """
     q = urlencode({
         "serviceKey": key,
         "LAWD_CD": lawd_cd,
@@ -173,7 +177,9 @@ def fetch(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> str:
         "numOfRows": NUM_OF_ROWS,
     })
     with urlopen(f"{API[kind]}?{q}", timeout=TIMEOUT_SEC) as resp:
-        return resp.read().decode("utf-8")
+        return (resp.read().decode("utf-8"),
+                resp.status,
+                resp.headers.get("Content-Type", ""))
 
 
 def check_error(root: ET.Element) -> str:
@@ -753,7 +759,7 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
     last_err = None
     for attempt in range(MAX_RETRY):
         try:
-            body = fetch(kind, lawd_cd, deal_ym, page, key)
+            body, status, ctype = fetch(kind, lawd_cd, deal_ym, page, key)
         except (URLError, TimeoutError, OSError) as e:
             last_err = e
             time.sleep(THROTTLE_SEC * (2 ** attempt))
@@ -762,7 +768,13 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
             root = ET.fromstring(body)
         except ET.ParseError:
             # 인증 실패나 서버 오류일 때 XML 이 아닌 본문이 오는 경우가 있음
-            raise ApiError("", f"XML 이 아닌 응답 {body[:200]!r}") from None
+            # 본문을 로그에 남기지 않음
+            #   - serviceKey 가 URL 쿼리에 포함 (fetch)
+            #   - 차단 페이지가 요청 URL 을 되비추면 키가 그대로 로그에 남음
+            #   - GitHub 시크릿 마스킹은 등록된 원문만 가림. %2F 등 인코딩 변형은 통과
+            #   - 공개 레포의 Actions 로그는 누구나 열람 가능
+            raise ApiError("", f"XML 이 아닌 응답 status={status} "
+                               f"content-type={ctype!r} length={len(body)}") from None
         check_error(root)
         return root
     raise ApiError("", f"{MAX_RETRY}회 다시 시도했지만 실패: {last_err}") from last_err
