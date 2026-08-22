@@ -24,6 +24,9 @@
         set -a; source .env; set +a
         python3 scripts/collect.py --kind trade --districts 11680 --months 202607
 
+    원본 응답을 남기며 확인 (파서를 의심할 때만)
+        python3 scripts/collect.py --kind trade --districts 11680 --months 202607 --save-raw
+
     서비스키는 디코딩 키를 쓸 것
       - urlencode() 가 키를 한 번 더 인코딩함
       - 인코딩 키를 넣으면 두 번 인코딩되어 에러 30
@@ -48,6 +51,8 @@ import xml.etree.ElementTree as ET
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 DISTRICTS_PATH = ROOT / "config" / "districts.json"
+RAW_DIR        = HERE / "raw"          # gitignore 대상. --save-raw 일 때만 씀
+RAW_PREFIX     = "collect_"            # recon.py 가 만든 같은 이름 파일을 덮지 않기 위함
 
 
 # ============================== 상수 ==============================
@@ -538,6 +543,7 @@ class CollectConfig:
     dry_run: bool = True
     sb_url: str = ""
     sb_key: str = ""
+    save_raw: bool = False   # 기본 꺼짐. 36개월 전량에 켜면 약 230MB""
 
 
 def _sb_config() -> tuple:
@@ -745,7 +751,30 @@ def mark_stale(kind: str, lawd_cd: str, deal_ym: str, seen_at: str, cfg: Collect
     return len(resp) if resp else 0
 
 
-def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> ET.Element:
+def _save_raw(kind: str, lawd_cd: str, deal_ym: str, page: int, body: str):
+    """원본 응답을 파일로 남김. 실패해도 예외를 올리지 않음.
+
+    파일명에 페이지를 넣는 이유
+      - 한 (구, 계약월) 이 여러 페이지일 수 있음 (강남구 202607 전월세는 2페이지)
+      - 페이지가 빠지면 뒤 페이지가 앞 페이지를 덮어써 조용히 사라짐
+    타임스탬프를 넣지 않는 이유
+      - 같은 (구, 계약월, 페이지) 는 덮어씀. 매번 새 파일이 쌓이면 관리 기능이 필요해짐
+    collect_ 접두사를 붙이는 이유
+      - recon.py 가 같은 규칙으로 만든 정찰 원본이 이미 있음. 덮으면 그 수치의 근거가 사라짐
+    저장 실패로 수집을 멈추지 않는 이유
+      - 원본은 진단 자료이지 수집 성공 조건이 아님
+      - 다만 조용히 넘어가지는 않음. 켰는데 안 남은 것을 알 수 있어야 함
+    """
+    path = RAW_DIR / kind / f"{RAW_PREFIX}{lawd_cd}_{deal_ym}_{page}.xml"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    except OSError as e:
+        print(f"  [경고] 원본 저장 실패 {path.name}: {e}")
+
+
+def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str,
+                 save_raw: bool = False) -> ET.Element:
     """한 페이지를 받아옴. 네트워크 오류만 다시 시도.
 
     다시 시도할 때마다 대기 시간을 두 배로 늘림 (0.2초, 0.4초, 0.8초)
@@ -776,6 +805,11 @@ def _fetch_page(kind: str, lawd_cd: str, deal_ym: str, page: int, key: str) -> E
             raise ApiError("", f"XML 이 아닌 응답 status={status} "
                                f"content-type={ctype!r} length={len(body)}") from None
         check_error(root)
+        # 저장은 반드시 check_error 뒤에
+        #   - 인증 실패 응답은 바깥 태그가 <OpenAPI_ServiceResponse> 로 바뀌지만 유효한 XML
+        #   - 파싱만으로는 안 걸러짐. 저장되면 나중에 정상 응답으로 오인해 파싱함
+        if save_raw:
+            _save_raw(kind, lawd_cd, deal_ym, page, body)
         return root
     raise ApiError("", f"{MAX_RETRY}회 다시 시도했지만 실패: {last_err}") from last_err
 
@@ -792,14 +826,14 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig,
     parser     = parse_trade if kind == "trade" else parse_rent
     key_fields = TRADE_KEY if kind == "trade" else RENT_KEY
 
-    root  = _fetch_page(kind, lawd_cd, deal_ym, 1, cfg.key)
+    root  = _fetch_page(kind, lawd_cd, deal_ym, 1, cfg.key, cfg.save_raw)
     total = int(root.findtext(".//totalCount") or 0)
     pages = max(1, math.ceil(total / NUM_OF_ROWS)) if total else 0
 
     all_rows = list(parser(root, lawd_cd, seen_at))
     for page in range(2, pages + 1):
         time.sleep(THROTTLE_SEC)
-        p_root = _fetch_page(kind, lawd_cd, deal_ym, page, cfg.key)
+        p_root = _fetch_page(kind, lawd_cd, deal_ym, page, cfg.key, cfg.save_raw)
         all_rows.extend(parser(p_root, lawd_cd, seen_at))
 
     merged, collapsed, amb, conflicts = merge_batch(all_rows, key_fields)
@@ -911,6 +945,8 @@ def main():
     ap.add_argument("--districts", default="all", help="'all' 또는 '11680,11590'")
     ap.add_argument("--dry-run", action="store_true", help="DB 에 쓰지 않고 건수만 확인")
     ap.add_argument("--no-resume", action="store_true", help="오늘 이미 성공한 것도 다시 받기")
+    ap.add_argument("--save-raw", action="store_true",
+                    help="검사를 통과한 원본 응답을 scripts/raw/{kind}/ 에 저장")
     args = ap.parse_args()
 
     key       = _get_key()
@@ -918,7 +954,7 @@ def main():
     districts = _resolve_districts(args.districts)
     kinds     = ("trade", "rent") if args.kind == "both" else (args.kind,)
 
-    cfg = CollectConfig(key=key, dry_run=args.dry_run)
+    cfg = CollectConfig(key=key, dry_run=args.dry_run, save_raw=args.save_raw)
     if not args.dry_run:
         cfg.sb_url, cfg.sb_key = _sb_config()
 
