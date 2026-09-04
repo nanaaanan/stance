@@ -6,8 +6,8 @@
 전제
     자연키    trade (apt_seq, deal_date, exclu_use_ar, floor, deal_amount)
               rent  (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
-    정규화    면적 반올림과 월세 결측 처리는 scripts/recon.py 와 같은 규칙이어야 함
-              두 파일의 규칙이 달라지면 recon.py 로 센 숫자와 DB 행 수가 어긋남
+    정규화    월세 결측 처리는 scripts/recon.py 와 같은 규칙이어야 함
+              면적은 recon 후속 작업 전까지 알려진 일시적 불일치가 있음
     payload   docs/data/schema.md 의 컬럼 목록과 정확히 같아야 함
     DB 준비   빈 값 보호 트리거(trg_trade_keep_filled, trg_rent_keep_filled)가
               먼저 적용돼 있어야 함. 없으면 빈 값이 이미 채워진 값을 지움
@@ -42,7 +42,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, DefaultContext, InvalidOperation, ROUND_HALF_UP, localcontext
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -241,8 +241,8 @@ def _int_soft(v, bad: collections.Counter, label: str):
         return None
 
 
-def _area(v) -> str:
-    """'84.98' -> '84.9800'. 소수 넷째 자리에서 반올림.
+def _area(v, apt_seq=None) -> str:
+    """'84.98' -> '84.9800'. 값 손실 없이 소수 넷째 자리에 맞춤.
 
     float 를 거치면 안 되는 이유
       - float 는 근사값이라 84.98 이 84.98000000000001 로 저장될 수 있음
@@ -254,9 +254,22 @@ def _area(v) -> str:
       - 그대로 두면 84.12345 같은 값에서 둘의 결과가 갈림
     """
     try:
-        return str(Decimal(v).quantize(AREA_SCALE, rounding=ROUND_HALF_UP))
+        d = Decimal(v)
     except InvalidOperation:
         raise ValueError(f"면적 변환 실패 {v!r}") from None
+
+    context = f"면적 원문={v!r} apt_seq={apt_seq!r}"
+    if not d.is_finite():
+        raise ApiError("AREA_NONFINITE", context)
+
+    try:
+        with localcontext(DefaultContext):
+            q = d.quantize(AREA_SCALE, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        raise ApiError("AREA_PRECISION", context) from None
+    if d != q:
+        raise ApiError("AREA_PRECISION", context)
+    return str(q)
 
 
 def _deal_date(r: dict) -> str:
@@ -319,7 +332,7 @@ def parse_trade(root: ET.Element, lawd_cd: str, seen_at: str) -> list:
             apt_seq = _require(r.get("aptseq", ""), "결측 aptSeq")
             apt_nm  = _require(r.get("aptnm", ""), "결측 aptNm")
             deal_date    = _deal_date(r)
-            exclu_use_ar = _area(r.get("excluusear", ""))
+            exclu_use_ar = _area(r.get("excluusear", ""), apt_seq)
             floor = _int(r.get("floor"))
             if floor is None:
                 raise ValueError("결측 floor")
@@ -384,7 +397,7 @@ def parse_rent(root: ET.Element, lawd_cd: str, seen_at: str) -> list:
             apt_seq = _require(r.get("aptseq", ""), "결측 aptSeq")
             apt_nm  = _require(r.get("aptnm", ""), "결측 aptNm")
             deal_date    = _deal_date(r)
-            exclu_use_ar = _area(r.get("excluusear", ""))
+            exclu_use_ar = _area(r.get("excluusear", ""), apt_seq)
             floor = _int(r.get("floor"))
             if floor is None:
                 raise ValueError("결측 floor")
