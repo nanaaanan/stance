@@ -11,7 +11,8 @@ DB 에 적재된 실거래를 서울시 공동주택 정보 CSV 와 대조해 �
               두 파일의 규칙이 달라지면 recon.py 로 낸 실측과 대조가 성립하지 않음
     읽기 전용 DB 에 쓰지 않음. complex 테이블도 만들지 않음
 
-    면적은 numeric(9,4) 원본 그대로 조합 키에 넣는다
+    기존 면적 조합 키는 numeric(9,4) 원본을 그대로 쓴다.
+    표시 그룹은 36개월 면적을 1 m2 인접 병합하고 최소 면적을 ID 로 쓴다.
       - ROUND() 단독 그룹핑은 폐기됨. 개포자이 13개 그룹 중 2개가 .5 경계에서 오분류
 
 실행
@@ -21,6 +22,15 @@ DB 에 적재된 실거래를 서울시 공동주택 정보 CSV 와 대조해 �
 
 산출물
     data/coverage-by-district.csv   한 행 = 한 개 구, 25행. utf-8-sig
+
+    combos_recent12m_group 은 최근 전체 거래 합계가 양수인 표시 그룹 수다.
+    combos_recent12m_group_valid 는 최근 valid 거래 합계가 양수인 표시 그룹 수다.
+    combos_1or2_all 은 최근 전체 거래 합계가 1 또는 2인 그룹 수이며 대조 전용이다.
+    combos_1or2_valid 는 최근 valid 거래 합계가 1 또는 2인 그룹 수다.
+    이 값은 판정, 화면, README 용이다.
+
+    valid 거래는 cdeal_type == "O" 인 해제 행 전체와 직거래를 제외한다.
+    ambiguous_cancel 해제 행은 정상 거래를 포함해 행 전체가 빠질 수 있다.
 """
 
 import argparse
@@ -49,6 +59,7 @@ MONTHS_RECENT = 12           # 커버리지 분자 창
 PAGE_SIZE     = 1000         # PostgREST 기본 상한
 TIMEOUT_SEC   = 60
 RATE_DIGITS   = 4            # 비율 표기 자릿수. 임계값이 아니라 표기 형식
+MERGE_GAP     = Decimal("1") # 표시 그룹의 인접 면적 병합 기준
 
 COLUMNS = [
     "lawd_cd", "district_name", "deal_rows", "deal_count",
@@ -57,6 +68,9 @@ COLUMNS = [
     "combos_36m", "combos_recent12m", "coverage_rate",
     "direct_deal_count", "direct_deal_rate",
     "cancel_count", "cancel_rate",
+    "combos_36m_group", "combos_recent12m_group",
+    "combos_recent12m_group_valid", "combos_1or2_all",
+    "combos_1or2_valid",
 ]
 
 # trade 에서 받을 컬럼. sgg_cd 와 is_current 는 필터로만 쓰므로 받지 않음
@@ -202,16 +216,36 @@ def fetch_district(sgg_cd: str, start: str, end: str, url: str, key: str) -> lis
 
 # ============================== 집계 ==============================
 def area_key(v) -> str:
-    """면적을 조합 키에 넣을 문자열로. 원본 자릿수를 유지.
+    """면적을 기존 조합 키나 표시 그룹 ID 에 넣을 문자열로 돌려줌.
 
-    반올림하지 않는 이유
-      - ROUND() 단독 그룹핑은 폐기됨 (.5 경계 오분류 실측)
-      - 표시용 그룹(인접 차이 1㎡ 미만 병합)은 D4 작업
+    기존 조합은 원본 자릿수를 유지한다.
+    표시 그룹은 display_groups()가 정규화한 최소 면적을 넘긴다.
+    ROUND() 단독 그룹핑은 .5 경계 오분류 실측으로 폐기됐다.
     """
     try:
         return str(Decimal(str(v)))
     except (InvalidOperation, TypeError):
         return ""
+
+
+def display_groups(areas) -> list[list[Decimal]]:
+    """같은 단지의 면적을 1 m2 인접 병합한 표시 그룹으로 돌려줌.
+
+    중복을 없애고 정렬하므로 입력 순서와 표기 자릿수에 영향받지 않음.
+    직전 면적과의 차가 MERGE_GAP 미만이면 같은 그룹으로 이어 붙임.
+    """
+    unique = set()
+    for area in areas:
+        value = Decimal(str(area)).normalize()
+        unique.add(Decimal(format(value, "f")))
+    ordered = sorted(unique)
+    groups = []
+    for area in ordered:
+        if not groups or area - groups[-1][-1] >= MERGE_GAP:
+            groups.append([area])
+        else:
+            groups[-1].append(area)
+    return groups
 
 
 def sort_key(r) -> tuple:
@@ -224,7 +258,8 @@ def sort_key(r) -> tuple:
       - 다만 건수 가중으로는 205/10,237 = 2.00%p 까지 움직일 수 있음
     """
     return (str(r.get("deal_date") or ""), area_key(r.get("exclu_use_ar")),
-            _int(r.get("floor")))
+            _int(r.get("floor")),
+            road_key(r.get("road_nm"), r.get("road_nm_bonbun"), r.get("road_nm_bubun")))
 
 
 def rate(num, den):
@@ -254,6 +289,36 @@ def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple
     per_apt = collections.defaultdict(list)
     for r in rows:
         per_apt[r["apt_seq"]].append(r)
+
+    group_ids = {}
+    group_keys = set()
+    wide_groups = 0
+    for apt, rs in per_apt.items():
+        groups = display_groups(r["exclu_use_ar"] for r in rs)
+        for group in groups:
+            group_id = area_key(group[0])
+            group_keys.add((apt, group_id))
+            if group[-1] - group[0] > MERGE_GAP:
+                wide_groups += 1
+            for area in group:
+                group_ids[(apt, area)] = group_id
+
+    recent_all = collections.defaultdict(int)
+    recent_valid = collections.defaultdict(int)
+    ambiguous_groups = set()
+    for r in rows:
+        if r["deal_ym"] < recent_start:
+            continue
+        area = Decimal(str(r["exclu_use_ar"]))
+        combo = (r["apt_seq"], group_ids[(r["apt_seq"], area)])
+        recent_all[combo] += r["trade_count"]
+        if r.get("ambiguous_cancel") and r["trade_count"] > 0:
+            ambiguous_groups.add(combo)
+        if r.get("cdeal_type") != "O" and r.get("dealing_gbn") != "직거래":
+            recent_valid[combo] += r["trade_count"]
+
+    positive_recent_all = {combo: count for combo, count in recent_all.items() if count > 0}
+    positive_recent_valid = {combo: count for combo, count in recent_valid.items() if count > 0}
 
     lookup = by_gu.get(gu_name, {})
     matched_apts, multi_cand = 0, 0
@@ -288,10 +353,27 @@ def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple
         "direct_deal_rate": rate(direct, deal_count),
         "cancel_count": cancel,
         "cancel_rate": rate(cancel, deal_count),
+        "combos_36m_group": len(group_keys),
+        "combos_recent12m_group": len(positive_recent_all),
+        "combos_recent12m_group_valid": len(positive_recent_valid),
+        "combos_1or2_all": sum(1 for count in positive_recent_all.values() if count in (1, 2)),
+        "combos_1or2_valid": sum(1 for count in positive_recent_valid.values() if count in (1, 2)),
     }
     diag = {"multi_cand": multi_cand, "miss_no_key": miss_no_key,
-            "miss_with_key": miss_with_key, "amb_rows": amb_rows, "amb_tc": amb_tc}
+            "miss_with_key": miss_with_key, "amb_rows": amb_rows, "amb_tc": amb_tc,
+            "wide_groups": wide_groups, "ambiguous_groups": len(ambiguous_groups)}
     return result, diag
+
+
+def write_csv(rows: list, path=OUT_PATH):
+    """구별 집계 행을 고정된 COLUMNS 순서로 CSV 에 씀."""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # utf-8-sig: 이 파일은 Excel 로 열어 볼 대상. BOM 이 없으면 구 이름이 깨짐
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
 
 
 # ============================== main ==============================
@@ -336,19 +418,18 @@ def main():
               f"단지={res['complexes']:>4,}({res['complexes_kapt_matched']:>4,} 매칭) "
               f"조합={res['combos_36m']:>5,}/{res['combos_recent12m']:>5,} "
               f"cov={res['coverage_rate'] or '-':>6s} "
+              f"그룹={res['combos_36m_group']:>5,}/{res['combos_recent12m_group']:>5,} "
+              f"cov_g={rate(res['combos_recent12m_group'], res['combos_36m_group']) or '-':>6s} "
               f"| 후보2+={diag['multi_cand']:>2} "
               f"미매칭(키없음/키있음)={diag['miss_no_key']}/{diag['miss_with_key']} "
-              f"ambiguous={diag['amb_rows']}({diag['amb_tc']})")
+              f"ambiguous={diag['amb_rows']}({diag['amb_tc']}) "
+              f"폭1㎡초과그룹={diag['wide_groups']} "
+              f"ambiguous영향그룹={diag['ambiguous_groups']}")
 
     if failed:
         print(f"\n[경고] 조회 실패 {len(failed)}개 구: {failed}")
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # utf-8-sig: 이 파일은 Excel 로 열어 볼 대상. BOM 이 없으면 구 이름이 깨짐
-    with open(OUT_PATH, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
-        w.writeheader()
-        w.writerows(out_rows)
+    write_csv(out_rows)
 
     print(f"\n{OUT_PATH.relative_to(ROOT)}  {len(out_rows)}행")
     print(f"합계  행={tot_rows:,}  건수={tot_count:,}")
