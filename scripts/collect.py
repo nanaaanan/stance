@@ -840,10 +840,19 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig,
     key_fields = TRADE_KEY if kind == "trade" else RENT_KEY
 
     root  = _fetch_page(kind, lawd_cd, deal_ym, 1, cfg.key, cfg.save_raw)
-    total = int(root.findtext(".//totalCount") or 0)
+    try:
+        total = int(root.findtext(".//totalCount"))
+    except (TypeError, ValueError):
+        total = None
     pages = max(1, math.ceil(total / NUM_OF_ROWS)) if total else 0
 
     all_rows = list(parser(root, lawd_cd, seen_at))
+    # 행 존재 판정은 all_rows 가 아니라 응답 원문의 item 태그
+    #   - 파서가 자연키 결측 행을 전부 버려도 빈 응답이 아님
+    #   - 총건수 미상인 채로 부분 적재하면 mark_stale 이 나머지를 is_current=false 로 뒤집음
+    if total is None and root.find(".//item") is not None:
+        raise ApiError("TOTALCOUNT_UNREADABLE",
+                       f"totalCount 를 읽지 못했는데 1페이지에 행이 있음: {kind} {lawd_cd} {deal_ym}")
     for page in range(2, pages + 1):
         time.sleep(THROTTLE_SEC)
         p_root = _fetch_page(kind, lawd_cd, deal_ym, page, cfg.key, cfg.save_raw)
@@ -891,7 +900,8 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig,
         sent_txt = "적재 안함"
     else:
         sent_txt = f"sent={sent:>5} in={inserted} up={updated} same={unchanged} stale={marked}"
-    line = (f"  {progress}{kind:5s} {lawd_cd} {deal_ym}: totalCount={total:>5} page={pages:>2}  "
+    total_txt = "NULL" if total is None else str(total)
+    line = (f"  {progress}{kind:5s} {lawd_cd} {deal_ym}: totalCount={total_txt:>5} page={pages:>2}  "
             f"parsed={len(all_rows):>5} merged={len(merged):>5} {sent_txt} "
             f"collapsed={collapsed:>3} ambiguous_cancel={amb}")
     if conflicts:
