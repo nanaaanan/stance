@@ -1,10 +1,11 @@
 # 실거래 원장 스키마
 
-국토교통부 아파트 실거래 API 응답을 담는 4개 테이블.
+국토교통부 아파트 실거래 API 응답을 담는 4개 테이블과 수집 건수 변화 이력 뷰 1개.
 
 |                     |                                                         |
 | ------------------- | ------------------------------------------------------- |
 | DDL                 | `supabase/migrations/20260818104853_deal_tables.sql`    |
+| 수집 건수 이력 뷰 DDL | `supabase/migrations/20260906092758_collect_count_history_view.sql` |
 | 설계 근거가 된 실측 | `data/recon-summary.md`                                 |
 | API 호출 예시       | `docs/api/molit-trade.http`, `docs/api/molit-rent.http` |
 
@@ -69,6 +70,8 @@
 | `rent`            | 전월세 계약 1건의 **현재 상태** | 같은 계약은 그 행을 고침   |
 | `deal_change_log` | 값이 바뀐 순간 1회              | 안 바뀌면 아무것도 안 쌓임 |
 | `collect_run`     | 수집 시도 1회                   | 덮어쓰지 않고 계속 쌓임    |
+
+`collect_count_history` 는 `collect_run` 에서 첫 관측과 건수 변화 시점을 읽는 뷰다. 별도로 저장하지 않는다.
 
 ### 매매와 전월세를 한 테이블로 합치지 않은 이유
 
@@ -261,6 +264,36 @@ concurrency:
 
 겹쳐 돌아도 데이터가 깨지지는 않는다. 자연키 upsert 라 결과가 같기 때문이다. 낭비되는 것은 API 호출 한도뿐이다. 그래서 차단은 실행을 관리하는 층에 두는 것이 맞다.
 
+### collect_count_history (뷰)
+
+`collect_run` 의 성공한 관측에서 같은 값의 반복을 접어 보여 주는 내부 운영 로그다. 원본 테이블, 컬럼, 인덱스는 추가하지 않는다.
+
+| 컬럼 | 타입 | 출처와 의미 |
+| --- | --- | --- |
+| `kind` | `text` | `collect_run.kind`. `trade` / `rent` |
+| `lawd_cd` | `text` | `collect_run.lawd_cd`. 5자리 구 코드 |
+| `deal_ym` | `text` | `collect_run.deal_ym`. 6자리 계약월 |
+| `started_at` | `timestamptz` | `collect_run.started_at`. 관측 시각 |
+| `run_id` | `bigint` | `collect_run.id`. 관측한 수집 회차 |
+| `total_count` | `integer` | `collect_run.total_count`. API 전체 건수, NULL 가능 |
+| `prev_total_count` | `integer` | 같은 조합의 직전 성공 관측값, NULL 가능 |
+| `is_first_observation` | `boolean` | 같은 조합의 첫 성공 관측인지 여부 |
+| `valid_until` | `timestamptz` | 다음 변화점의 `started_at`. 마지막 구간은 NULL |
+
+행을 고르는 순서는 다음과 같다.
+
+1. `status = 'ok'` 만 관측으로 삼는다. `running` / `error` 는 제외한다.
+2. `(kind, lawd_cd, deal_ym)` 별로 `(started_at, id)` 오름차순으로 정렬하고 `lag(total_count)` 로 직전 값을 구한다.
+3. 첫 관측이거나 `total_count IS DISTINCT FROM prev_total_count` 인 행만 남긴다. 첫 값이 NULL 이어도 남고, NULL 과 0 은 다르다.
+4. 남은 변화점에 `lead(started_at)` 을 적용해 `valid_until` 을 구한다. 반복 관측 시각은 구간의 끝이 아니다.
+
+`prev_total_count IS NULL` 만으로 첫 관측을 판정하지 않는다. 직전 관측값 자체가 NULL 일 수 있기 때문이다.
+구간 안의 관측 횟수는 `collect_run` 원본에서 센다. 조회 결과의 표시 순서는 호출 쿼리에서 `ORDER BY` 로 정한다.
+
+`security_invoker = true` 로 조회한 역할의 원본 권한과 RLS 를 적용한다. 뷰에 RLS 정책을 만들지 않고, 같은 마이그레이션에서 `anon` / `authenticated` / `service_role` 권한을 회수한 뒤 `service_role` 에 SELECT 만 준다.
+
+현재 로더는 빈 `totalCount` 를 0 으로 저장한다. 이 뷰는 저장된 값을 그대로 읽으므로 과거의 빈 응답을 NULL 로 복원하지 못한다. 파서의 NULL 보존은 다음 로더 작업에서 구현한다.
+
 ### deal_change_log
 
 값이 실제로 바뀐 순간만 기록한다. `trade` 나 `rent` 가 UPDATE 될 때 트리거가 자동으로 넣는다.
@@ -303,6 +336,17 @@ concurrency:
 <br/>
 
 ## API 필드 매핑
+
+### 수집 건수 (매매 / 전월세 공통)
+
+| 입력 | 저장 컬럼 | 뷰 컬럼과 처리 |
+| --- | --- | --- |
+| 응답 본문의 `totalCount` | `collect_run.total_count` | `collect_count_history.total_count`. 저장된 정수 또는 NULL 을 그대로 비교 |
+| 수집 종류, 요청 `LAWD_CD`, `DEAL_YMD` | `collect_run.kind`, `lawd_cd`, `deal_ym` | 같은 이름의 뷰 컬럼. 변화 이력을 나누는 조합 |
+| 수집 시작 시각, DB 회차 ID | `collect_run.started_at`, `id` | `started_at`, `run_id`. 관측 순서와 동점 순서를 결정 |
+
+`prev_total_count`, `is_first_observation`, `valid_until` 은 API 필드가 아니라 위 뷰 규칙으로 계산한다.
+이번 마이그레이션은 파서를 바꾸지 않는다. 현재 빈 태그 / 태그 부재는 0 으로 저장되고, 공백 / 비정수는 정수 변환에 실패한다. NULL 보존 처리는 다음 스텝이다.
 
 ### 매매 -- `getRTMSDataSvcAptTradeDev`
 
@@ -476,6 +520,7 @@ trg_rent_keep_filled
 | ------------------------------- | ------------------------------- | ---------------------------- |
 | `trade` `rent`                  | 읽기만                          | 읽기, 넣기, 고치기           |
 | `deal_change_log` `collect_run` | 접근 불가                       | 읽기, 넣기, 고치기           |
+| `collect_count_history` (뷰)    | 접근 불가                       | 읽기만                      |
 
 - RLS 는 4개 테이블 모두 켠다. `trade`/`rent` 에만 전체 읽기 정책을 둔다
 - `anon` 을 넣는 이유: 익명 세션 발급이 끝나기 전에 데이터를 요청하는 구간이 있고, 그때 역할은 `authenticated` 가 아니라 `anon` 이다
