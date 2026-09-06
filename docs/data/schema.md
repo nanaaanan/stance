@@ -543,6 +543,7 @@ trg_rent_keep_filled
 | 6   | 이력과 수집 회차 연결                 | `run_id` 채워짐         |
 | 7   | `deal_ym` 자동 계산                   | `202607`                |
 | 8   | 이력이 있는 원본을 지우려 하면        | 거부됨 (RESTRICT)       |
+| 9   | `rent` 도로명에 번지가 두 번 들어갔는지 | 0건 (서울 25구 505,077행) |
 
 ### 재현 방법
 
@@ -581,6 +582,55 @@ select (select count(*) from public.trade
           where old_row ->> 'apt_seq' = 'TEST-0001')       as fields;       -- 기대 {rgst_date}
 
 rollback;
+```
+
+### 전월세 도로명 검증 (강남구)
+
+`rent` 의 도로명 칸은 `road_nm_full` **하나뿐이다.** 번지가 이미 붙어서 온다.
+`trade` 처럼 `road_nm` + `road_nm_bonbun` 을 조립하면 "삼성로 212 212" 가 된다.
+
+**틀린 컬럼명으로 돌리면 검증이 통과한 것으로 오인된다.** `road_nm` 을 참조하면
+`42703 column "road_nm" does not exist` 로 끝나는데, 이건 쿼리가 안 돌았다는 뜻이지
+번지 중복이 없다는 뜻이 아니다.
+
+```sql
+select count(*)                                                         as rows_total,
+       count(*) filter (where road_nm_full is null)                     as road_null,
+       count(*) filter (where road_nm_full !~ ' \d+(-\d+)?$')             as no_bonbun,
+       count(*) filter (where road_nm_full ~ '(\d+(-\d+)?)\s+\1(\s|$)')   as dup_bonbun
+  from public.rent
+ where sgg_cd = '11680';
+```
+
+| 칸           | 뜻                            | 기대 |
+| ------------ | ----------------------------- | ---- |
+| `rows_total` | 강남구 전월세 행 수           | 수집분만큼 |
+| `road_null`  | 도로명이 비어 있는 행         | 있을 수 있다. 세어서 드러내기만 한다 |
+| `no_bonbun`  | 끝이 번지로 끝나지 않는 행    | 강남구 0. 서울 전체는 8 (성북구 고려대로, 원문에 번지 없음) |
+| `dup_bonbun` | 같은 번지가 두 번 들어간 행   | **0. 이 칸 하나가 합격선이다** |
+
+**2026-09-07 결과.** 강남구 43,958행 / `road_null` 3 / `no_bonbun` 0 / `dup_bonbun` 0.
+distinct 675개가 전부 "도로명 번지" 두 토큰이었다.
+서울 25구 전체로도 돌렸다. 505,077행 / `road_null` 1,117 / `no_bonbun` 8 / `dup_bonbun` 0.
+
+`no_bonbun` 8건은 성북구 `고려대로` 한 값이고 원문에 번지가 없다.
+**`road_null` 과 `no_bonbun` 은 합격선이 아니라 관측값이다.** 번지를 조립했는지는
+`dup_bonbun` 만으로 판정한다.
+
+**통과만 보고 끝내지 않는다.** 검사식이 살아 있는지 아래로 확인한다.
+`dup_bonbun` 이 `삼성로 212 212` 와 `삼성로 212-3 212-3` 을 잡고,
+`no_bonbun` 이 `삼성로` 를 잡아야 한다.
+
+```sql
+select v,
+       v !~ ' \d+(-\d+)?$'           as no_bonbun,
+       v ~ '(\d+(-\d+)?)\s+\1(\s|$)' as dup_bonbun
+  from (values ('삼성로 212'),
+               ('삼성로 212 212'),
+               ('압구정로29길 23'),
+               ('압구정로29길 23 23'),
+               ('삼성로 212-3 212-3'),
+               ('삼성로')) t(v);
 ```
 
 ### 수집기로 확인한 것 (강남구 2026-07)
