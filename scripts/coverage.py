@@ -6,9 +6,7 @@ DB 에 적재된 실거래를 서울시 공동주택 정보 CSV 와 대조해 �
     입력      Supabase trade 테이블 (raw XML 아님)
               data/seoul-apt-info.csv (cp949, 서울 전체)
               config/districts.json (25개 구)
-    매칭      도로명 단독. 이름/지번 매칭은 폐기됨
-    정규화    도로명 키 규칙은 scripts/recon.py 의 road_key() 와 같아야 함
-              두 파일의 규칙이 달라지면 recon.py 로 낸 실측과 대조가 성립하지 않음
+    매칭      scripts/matching.py 가 도로명 매칭 규칙을 소유
     읽기 전용 DB 에 쓰지 않음. complex 테이블도 만들지 않음
 
     기존 면적 조합 키는 numeric(9,4) 원본을 그대로 쓴다.
@@ -41,14 +39,15 @@ import os
 import pathlib
 import sys
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import matching
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 DISTRICTS_PATH = ROOT / "config" / "districts.json"
-KAPT_CSV_PATH  = ROOT / "data" / "seoul-apt-info.csv"
 OUT_PATH       = ROOT / "data" / "coverage-by-district.csv"
 
 
@@ -93,78 +92,12 @@ def month_range(as_of: str, n: int) -> tuple:
     return f"{total // 12:04d}{total % 12 + 1:02d}", as_of
 
 
-# ============================== 도로명 키 ==============================
-def _int(v) -> int:
-    """'00221' -> 221. 빈 값이나 숫자가 아니면 0."""
-    try:
-        return int(str(v).strip())
-    except (TypeError, ValueError):
-        return 0
-
-
-def road_key(rn, bonbun, bubun) -> str:
-    """실거래: '선릉로' + '00221' + '00000' -> '선릉로 221'
-
-    scripts/recon.py 의 road_key() 와 문자 단위로 같은 결과를 내야 함
-      - 규칙이 갈라지면 recon.py 로 낸 강남구 실측(39.3%/84.3%)과 대조 불가
-    실거래는 본번이 zero-pad 되어 오고, CSV 는 원문 그대로라 여기서 맞춤
-    부번이 0 이면 붙이지 않음
-    """
-    b, s = _int(bonbun), _int(bubun)
-    if not str(rn).strip() or not b:
-        return ""
-    return f"{str(rn).strip()} {b}" + (f"-{s}" if s else "")
-
-
-def kapt_key(road_nm, detail) -> str:
-    """K-apt: '주소(도로명)' + '주소(도로상세주소)' -> '선릉로 221'."""
-    rn, de = str(road_nm or "").strip(), str(detail or "").strip()
-    return f"{rn} {de}" if rn and de else ""
-
-
 # ============================== 입력 로딩 ==============================
 def load_districts() -> list:
     """config/districts.json 이 25개 구의 유일한 출처. 코드를 코드에 박지 않음."""
     with open(DISTRICTS_PATH, encoding="utf-8") as f:
         items = json.load(f)["districts"]
     return sorted(((d["code"], d["name"]) for d in items), key=lambda x: x[0])
-
-
-def load_kapt() -> tuple:
-    """도로명 조회 사전 생성. { 시군구 -> { road_key -> [(코드, 이름), ...] } }
-
-    서울 전체를 로드하고 구로 파티션하는 이유
-      - 구로 걸러 로드하면 다른 구가 전부 미매칭이 됨 (과거 폐기 사례)
-      - 그렇다고 한 사전에 뭉치면 다른 구의 같은 도로명에 잘못 붙을 수 있음
-      - 현 스냅샷에서 구를 넘는 중복 키는 0개지만 계약으로 보장된 값이 아님
-    후보를 리스트로 보존하는 이유
-      - 같은 구 안에 같은 키가 2행 이상인 경우가 82개 있음
-      - 판정에는 영향이 없지만 버렸다는 사실을 세기 위함
-    """
-    rows, decoded = [], False
-    # 디코딩이 조용히 성공할 수 있어, 예외 여부가 아니라 컬럼 존재로 확인
-    for enc in ("cp949", "utf-8-sig", "euc-kr", "utf-8"):
-        try:
-            with open(KAPT_CSV_PATH, encoding=enc, newline="") as f:
-                rows = list(csv.DictReader(f))
-        except (UnicodeDecodeError, LookupError):
-            continue
-        if rows and "주소(도로명)" in rows[0]:
-            decoded = True
-            break
-    if not decoded:
-        sys.exit(f"[중단] {KAPT_CSV_PATH.name} 을 읽지 못했습니다. 인코딩과 컬럼명을 확인하세요.")
-
-    by_gu, n = collections.defaultdict(dict), 0
-    for r in rows:
-        k = kapt_key(r.get("주소(도로명)"), r.get("주소(도로상세주소)"))
-        if not k:
-            continue
-        gu = (r.get("주소(시군구)") or "").strip()
-        by_gu[gu].setdefault(k, []).append(
-            ((r.get("k-아파트코드") or "").strip(), (r.get("k-아파트명") or "").strip()))
-        n += 1
-    return by_gu, len(rows), n
 
 
 # ============================== Supabase ==============================
@@ -215,19 +148,6 @@ def fetch_district(sgg_cd: str, start: str, end: str, url: str, key: str) -> lis
 
 
 # ============================== 집계 ==============================
-def area_key(v) -> str:
-    """면적을 기존 조합 키나 표시 그룹 ID 에 넣을 문자열로 돌려줌.
-
-    기존 조합은 원본 자릿수를 유지한다.
-    표시 그룹은 display_groups()가 정규화한 최소 면적을 넘긴다.
-    ROUND() 단독 그룹핑은 .5 경계 오분류 실측으로 폐기됐다.
-    """
-    try:
-        return str(Decimal(str(v)))
-    except (InvalidOperation, TypeError):
-        return ""
-
-
 def display_groups(areas) -> list[list[Decimal]]:
     """같은 단지의 면적을 1 m2 인접 병합한 표시 그룹으로 돌려줌.
 
@@ -248,20 +168,6 @@ def display_groups(areas) -> list[list[Decimal]]:
     return groups
 
 
-def sort_key(r) -> tuple:
-    """대표 도로명을 고를 때 쓰는 결정적 정렬 순서.
-
-    첫 행을 고정하는 것은 recon.py 의 setdefault 와 같은 성격
-    정렬을 명시하는 이유는 recon.py 와의 일치가 아니라
-    이 스크립트가 실행할 때마다 같은 값을 낸다는 것 자체
-      - 도로명이 갈리는 단지는 강남구 512개 중 4개(0.78%)
-      - 다만 건수 가중으로는 205/10,237 = 2.00%p 까지 움직일 수 있음
-    """
-    return (str(r.get("deal_date") or ""), area_key(r.get("exclu_use_ar")),
-            _int(r.get("floor")),
-            road_key(r.get("road_nm"), r.get("road_nm_bonbun"), r.get("road_nm_bubun")))
-
-
 def rate(num, den):
     """분모가 0 이면 빈 칸. 0 으로 메우지 않는다."""
     if not den:
@@ -269,7 +175,7 @@ def rate(num, den):
     return f"{num / den:.{RATE_DIGITS}f}"
 
 
-def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple:
+def aggregate(rows: list, gu_name: str, index: matching.KaptIndex, recent_start: str) -> tuple:
     """한 구의 지표를 계산. (결과 dict, 진단 dict) 를 돌려줌."""
     deal_rows  = len(rows)
     deal_count = sum(r["trade_count"] for r in rows)
@@ -281,8 +187,8 @@ def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple
     amb_rows = sum(1 for r in rows if r.get("ambiguous_cancel"))
     amb_tc   = sum(r["trade_count"] for r in rows if r.get("ambiguous_cancel"))
 
-    combos_36 = {(r["apt_seq"], area_key(r["exclu_use_ar"])) for r in rows}
-    combos_12 = {(r["apt_seq"], area_key(r["exclu_use_ar"]))
+    combos_36 = {(r["apt_seq"], matching.area_key(r["exclu_use_ar"])) for r in rows}
+    combos_12 = {(r["apt_seq"], matching.area_key(r["exclu_use_ar"]))
                  for r in rows if r["deal_ym"] >= recent_start}
 
     # 단지 단위로 묶어 대표 도로명 결정
@@ -296,7 +202,7 @@ def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple
     for apt, rs in per_apt.items():
         groups = display_groups(r["exclu_use_ar"] for r in rs)
         for group in groups:
-            group_id = area_key(group[0])
+            group_id = matching.area_key(group[0])
             group_keys.add((apt, group_id))
             if group[-1] - group[0] > MERGE_GAP:
                 wide_groups += 1
@@ -320,20 +226,17 @@ def aggregate(rows: list, gu_name: str, by_gu: dict, recent_start: str) -> tuple
     positive_recent_all = {combo: count for combo, count in recent_all.items() if count > 0}
     positive_recent_valid = {combo: count for combo, count in recent_valid.items() if count > 0}
 
-    lookup = by_gu.get(gu_name, {})
     matched_apts, multi_cand = 0, 0
     matched_deals = 0
     miss_no_key, miss_with_key = 0, 0
     for apt, rs in per_apt.items():
-        head = min(rs, key=sort_key)
-        k = road_key(head.get("road_nm"), head.get("road_nm_bonbun"), head.get("road_nm_bubun"))
-        cands = lookup.get(k) if k else None
-        if cands:
+        _, cands, status = matching.match_complex(index, gu_name, rs)
+        if status == "matched":
             matched_apts += 1
             matched_deals += sum(x["trade_count"] for x in rs)
             if len(cands) > 1:
                 multi_cand += 1
-        elif not k:
+        elif status == "no_key":
             miss_no_key += 1
         else:
             miss_with_key += 1
@@ -391,12 +294,12 @@ def main():
     recent_start, _      = month_range(as_of, MONTHS_RECENT)
 
     districts = load_districts()
-    by_gu, csv_rows, csv_keys = load_kapt()
+    index = matching.KaptIndex.load()
     url, key = sb_config()
 
     print(f"기준월 {as_of}  |  분모 {long_start}~{long_end} ({MONTHS_LONG}개월)"
           f"  |  분자 {recent_start}~{long_end} ({MONTHS_RECENT}개월)")
-    print(f"K-apt 마스터: {csv_rows:,}행 중 도로명 키 {csv_keys:,}개, {len(by_gu)}개 구로 파티션")
+    print(f"K-apt 마스터: {index.source_rows:,}행 중 도로명 키 {index.key_rows:,}개, {index.gu_count}개 구로 파티션")
     print(f"대상 {len(districts)}개 구\n")
 
     out_rows, failed = [], []
@@ -408,7 +311,7 @@ def main():
             print(f"[{i:2d}/{len(districts)}] {code} {name:6s} 조회 실패: {e}")
             failed.append(code)
             continue
-        res, diag = aggregate(rows, name, by_gu, recent_start)
+        res, diag = aggregate(rows, name, index, recent_start)
         res["lawd_cd"], res["district_name"] = code, name
         out_rows.append(res)
         tot_rows  += res["deal_rows"]

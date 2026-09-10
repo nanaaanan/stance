@@ -1,10 +1,15 @@
 import csv
 import random
+import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
 
+from scripts import matching
+
+# coverage.py 의 직접 실행과 같은 인접 모듈 이름으로 테스트에 연결
+sys.modules["matching"] = matching
 from scripts import coverage
 
 
@@ -71,7 +76,8 @@ def aggregate(rows):
             "테스트로 2": [("K-B", "B")],
         }
     }
-    return coverage.aggregate(rows, "테스트구", by_gu, RECENT_START)
+    index = matching.KaptIndex(by_gu, source_rows=2, key_rows=2)
+    return coverage.aggregate(rows, "테스트구", index, RECENT_START)
 
 
 def regression_rows():
@@ -128,8 +134,8 @@ class CoverageTest(unittest.TestCase):
 
         forward = coverage.display_groups((Decimal("84.98"), Decimal("84.9800")))
         reverse = coverage.display_groups((Decimal("84.9800"), Decimal("84.98")))
-        self.assertEqual(coverage.area_key(forward[0][0]), "84.98")
-        self.assertEqual(coverage.area_key(reverse[0][0]), "84.98")
+        self.assertEqual(matching.area_key(forward[0][0]), "84.98")
+        self.assertEqual(matching.area_key(reverse[0][0]), "84.98")
 
     def test_aggregate_order_invariance(self):
         rows = regression_rows()
