@@ -2,11 +2,13 @@ import contextlib
 import hashlib
 import io
 import pathlib
+import random
 import shutil
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
+from decimal import Decimal
 
 import openpyxl
 
@@ -251,6 +253,241 @@ class KaptAreaLoaderTest(unittest.TestCase):
             stored = self._stored_column_text(path, "A")
 
         self.assertEqual(stored, ["주거전용면적(세부)", "84.9"])
+
+
+class AreaMatchingTest(unittest.TestCase):
+    def test_display_groups_are_order_independent_and_keep_exact_gap_boundary(self):
+        values = [59.9751, 59.9818, 78.7747, 84.5978, 84.9800, 109.8841]
+
+        self.assertEqual(area.display_groups(values), area.display_groups(reversed(values)))
+        self.assertEqual(len(area.display_groups([60, 60.999])), 1)
+        self.assertEqual(len(area.display_groups([60, 61])), 2)
+        self.assertEqual(len(area.display_groups([60, 61.001])), 2)
+
+    def test_nearest_match_includes_half_and_rejects_outside_or_tie(self):
+        self.assertEqual(
+            area.nearest_kapt_area("60.5", ["60.0"]),
+            (area.STATUS_MATCHED, Decimal("60")),
+        )
+        self.assertEqual(
+            area.nearest_kapt_area("60.5001", ["60.0"]),
+            (area.STATUS_OUTSIDE, None),
+        )
+        self.assertEqual(
+            area.nearest_kapt_area("60.0", ["59.0", "61.0"]),
+            (area.STATUS_OUTSIDE, None),
+        )
+        self.assertEqual(
+            area.nearest_kapt_area("60.5", ["60.0", "61.0"]),
+            (area.STATUS_TIE, None),
+        )
+        self.assertEqual(
+            area.nearest_kapt_area("60.5", ["61.0", "60.0"]),
+            (area.STATUS_TIE, None),
+        )
+        self.assertEqual(
+            area.nearest_kapt_area("84.1", ["84.0", "84.2"]),
+            (area.STATUS_TIE, None),
+        )
+
+    def test_label_uses_integer_households_then_area_tiebreak(self):
+        larger_household_count = area.display_group_metadata(
+            {Decimal("84.4"): "9", Decimal("85.3"): "10"}
+        )
+        tied_reversed = area.display_group_metadata(
+            {Decimal("85.3"): "10", Decimal("84.4"): "10"}
+        )
+
+        self.assertEqual(larger_household_count[Decimal("84.4")]["group_label"], "85")
+        self.assertEqual(tied_reversed[Decimal("85.3")]["group_label"], "84")
+
+    def test_labels_use_round_half_up_at_adjacent_half_values(self):
+        metadata = area.fallback_group_metadata([Decimal("84.5"), Decimal("85.5")])
+        collision_guard = area.fallback_group_metadata(
+            [Decimal("83.5"), Decimal("84.5")]
+        )
+
+        self.assertEqual(metadata[Decimal("84.5")]["group_label"], "85")
+        self.assertEqual(metadata[Decimal("85.5")]["group_label"], "86")
+        self.assertNotEqual(
+            metadata[Decimal("84.5")]["group_label"],
+            metadata[Decimal("85.5")]["group_label"],
+        )
+        self.assertEqual(collision_guard[Decimal("83.5")]["group_label"], "84")
+        self.assertEqual(collision_guard[Decimal("84.5")]["group_label"], "85")
+
+    def test_boundary_conflict_counter_is_symmetric(self):
+        boundary = (Decimal("85"),)
+
+        self.assertEqual(area.boundary_conflict_count("84.9", "85.1", boundary), 1)
+        self.assertEqual(area.boundary_conflict_count("85.1", "84.9", boundary), 1)
+        self.assertEqual(area.boundary_conflict_count("84.9", "84.95", boundary), 0)
+
+    def test_build_rows_preserves_unmatched_nulls_and_failure_reasons(self):
+        trade_rows = [
+            {"apt_seq": "M", "exclu_use_ar": Decimal("60.5")},
+            {"apt_seq": "O", "exclu_use_ar": Decimal("62")},
+            {"apt_seq": "T", "exclu_use_ar": Decimal("60.5")},
+            {"apt_seq": "N", "exclu_use_ar": Decimal("84.5")},
+            {"apt_seq": "N", "exclu_use_ar": Decimal("85.5")},
+        ]
+        crosswalk = {
+            apt: {
+                "sgg_cd": "1",
+                "apt_seq": apt,
+                "apt_nm": apt,
+                "road_key": "길 1",
+                "kapt_code": code,
+            }
+            for apt, code in (("M", "KM"), ("O", "KO"), ("T", "KT"), ("N", ""))
+        }
+        kapt_index = {
+            "KM": {Decimal("60"): 10},
+            "KO": {Decimal("60"): 20},
+            "KT": {Decimal("60"): 30, Decimal("61"): 40},
+        }
+
+        rows, failures, _ = area.build_area_rows(trade_rows, crosswalk, kapt_index)
+        by_apt = {row["apt_seq"]: row for row in rows if row["apt_seq"] != "N"}
+        no_kapt = [row for row in rows if row["apt_seq"] == "N"]
+
+        self.assertEqual(by_apt["M"]["area_status"], area.STATUS_MATCHED)
+        self.assertEqual(by_apt["M"]["kapt_area"], "60")
+        self.assertEqual(by_apt["M"]["households"], "10")
+        for apt in ("O", "T"):
+            self.assertEqual(by_apt[apt]["kapt_area"], "")
+            self.assertEqual(by_apt[apt]["households"], "")
+        self.assertEqual(by_apt["O"]["area_status"], area.STATUS_OUTSIDE)
+        self.assertEqual(by_apt["T"]["area_status"], area.STATUS_TIE)
+        self.assertEqual(failures, {"O": {area.STATUS_OUTSIDE}, "T": {area.STATUS_TIE}})
+        self.assertEqual([row["group_label"] for row in no_kapt], ["85", "86"])
+        self.assertTrue(all(row["kapt_code"] == "" for row in no_kapt))
+        self.assertTrue(all(row["households"] == "" for row in no_kapt))
+
+    def test_failure_append_is_idempotent_and_keeps_road_block(self):
+        road = {
+            "sgg_cd": "1",
+            "apt_seq": "R",
+            "apt_nm": "도로 실패",
+            "road_key": "",
+            "fail_reason": "K-apt 마스터에 없음",
+        }
+        old_area = {
+            "sgg_cd": "1",
+            "apt_seq": "A",
+            "apt_nm": "면적 실패",
+            "road_key": "길 1",
+            "fail_reason": area.STATUS_OUTSIDE,
+        }
+        crosswalk = {
+            "A": {
+                "sgg_cd": "1",
+                "apt_seq": "A",
+                "apt_nm": "면적 실패",
+                "road_key": "길 1",
+                "kapt_code": "K",
+            }
+        }
+
+        first = area.build_failure_rows(
+            [road, old_area], crosswalk, {"A": {area.STATUS_OUTSIDE}}
+        )
+        second = area.build_failure_rows(
+            first, crosswalk, {"A": {area.STATUS_OUTSIDE}}
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], road)
+        self.assertEqual(len(first), 2)
+
+    def test_g4_requires_committed_tie_approval(self):
+        tie = {
+            "sgg_cd": "1",
+            "apt_seq": "T",
+            "apt_nm": "동점",
+            "road_key": "길 1",
+            "fail_reason": area.STATUS_TIE,
+        }
+
+        self.assertEqual(area.unapproved_tie_apts([tie], []), ["T"])
+        self.assertEqual(area.unapproved_tie_apts([tie], [tie]), [])
+
+    def test_g5b_recomputes_nearest_invariant_independently(self):
+        trade_rows = [{"apt_seq": "A", "exclu_use_ar": Decimal("60.4")}]
+        crosswalk = {
+            "A": {
+                "sgg_cd": "1",
+                "apt_seq": "A",
+                "apt_nm": "검증",
+                "road_key": "길 1",
+                "kapt_code": "K",
+            }
+        }
+        kapt_index = {"K": {Decimal("60"): 10, Decimal("70"): 20}}
+        original = area.nearest_kapt_area
+        area.nearest_kapt_area = lambda exclu, candidates: (
+            area.STATUS_MATCHED,
+            max(candidates),
+        )
+        try:
+            rows, _, diagnostics = area.build_area_rows(
+                trade_rows, crosswalk, kapt_index
+            )
+            with self.assertRaisesRegex(ValueError, "G5b"):
+                area._validate_output_rows(
+                    rows,
+                    diagnostics["combos_by_apt"],
+                    crosswalk,
+                    kapt_index,
+                )
+        finally:
+            area.nearest_kapt_area = original
+
+    def test_source_group_metadata_is_order_independent_for_every_kapt_code(self):
+        index = area.build_kapt_index(area.load_kapt_area_rows(SOURCE))
+        crosswalk = area.load_crosswalk()
+        referenced_codes = sorted(
+            {
+                row["kapt_code"]
+                for row in crosswalk.values()
+                if row["kapt_code"] in index
+            }
+        )
+        rng = random.Random(0)
+
+        mismatches = []
+        for code in referenced_codes:
+            values = index[code]
+            baseline = area.display_group_metadata(values)
+            reversed_values = dict(reversed(list(values.items())))
+            if area.display_group_metadata(reversed_values) != baseline:
+                mismatches.append(code)
+                continue
+            for _ in range(3):
+                shuffled_values = list(values.items())
+                rng.shuffle(shuffled_values)
+                if area.display_group_metadata(dict(shuffled_values)) != baseline:
+                    mismatches.append(code)
+                    break
+
+        self.assertEqual(len(referenced_codes), 2_274)
+        self.assertEqual(mismatches, [])
+
+    def test_source_half_up_regressions_and_full_kapt_axis(self):
+        index = area.build_kapt_index(area.load_kapt_area_rows(SOURCE))
+        cases = (
+            ("A10022623", Decimal("44.5"), "45"),
+            ("A10024240", Decimal("148.5"), "149"),
+            ("A12010103", Decimal("58.5"), "59"),
+        )
+
+        for code, source_area, expected_label in cases:
+            with self.subTest(code=code, source_area=source_area):
+                metadata = area.display_group_metadata(index[code])
+                self.assertEqual(metadata[source_area]["group_label"], expected_label)
+
+        gaepo = area.display_group_metadata(index["A10023348"])
+        self.assertEqual(len({record["group_id"] for record in gaepo.values()}), 11)
 
 
 if __name__ == "__main__":
