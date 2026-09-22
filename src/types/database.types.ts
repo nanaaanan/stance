@@ -89,6 +89,89 @@ export type Database = {
         }
         Relationships: []
       }
+      complex: {
+        Row: {
+          apt_nm: string
+          apt_seq: string
+          first_seen_at: string
+          kapt_code: string | null
+          kapt_key: string | null
+          last_seen_at: string
+          match_source: string | null
+          road_key: string | null
+          sgg_cd: string
+        }
+        Insert: {
+          apt_nm: string
+          apt_seq: string
+          first_seen_at?: string
+          kapt_code?: string | null
+          kapt_key?: string | null
+          last_seen_at?: string
+          match_source?: string | null
+          road_key?: string | null
+          sgg_cd: string
+        }
+        Update: {
+          apt_nm?: string
+          apt_seq?: string
+          first_seen_at?: string
+          kapt_code?: string | null
+          kapt_key?: string | null
+          last_seen_at?: string
+          match_source?: string | null
+          road_key?: string | null
+          sgg_cd?: string
+        }
+        Relationships: []
+      }
+      complex_area: {
+        Row: {
+          apt_seq: string
+          area_status: string
+          exclu_use_ar: number
+          first_seen_at: string
+          group_areas: string | null
+          group_id: string | null
+          group_label: number | null
+          households: number | null
+          kapt_area: number | null
+          last_seen_at: string
+        }
+        Insert: {
+          apt_seq: string
+          area_status: string
+          exclu_use_ar: number
+          first_seen_at?: string
+          group_areas?: string | null
+          group_id?: string | null
+          group_label?: number | null
+          households?: number | null
+          kapt_area?: number | null
+          last_seen_at?: string
+        }
+        Update: {
+          apt_seq?: string
+          area_status?: string
+          exclu_use_ar?: number
+          first_seen_at?: string
+          group_areas?: string | null
+          group_id?: string | null
+          group_label?: number | null
+          households?: number | null
+          kapt_area?: number | null
+          last_seen_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "complex_area_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
       deal_change_log: {
         Row: {
           changed_at: string
