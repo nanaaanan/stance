@@ -71,6 +71,7 @@ TIMEOUT_SEC  = 30
 UPSERT_CHUNK = 500
 
 AREA_SCALE = Decimal("0.0001")   # exclu_use_ar 컬럼이 numeric(9,4) 라 소수 넷째 자리까지
+# 이 정규화 규칙을 바꾸면 load_complex.py::_required_area도 함께 바꾼다.
 
 # 정상 응답 코드. raw 응답 38개 전부 '000' 이었음
 OK_CODES = ("000", "00")
@@ -575,6 +576,7 @@ def _sb_config() -> tuple:
     return url.rstrip("/"), key
 
 
+# load_complex.py::upsert_rows도 이 함수 사용
 def _sb_request(method: str, path: str, sb_url: str, sb_key: str, body=None, prefer=None,
                  extra_headers=None):
     """PostgREST 요청 한 번. 응답 본문이 있으면 그 값을, 없으면 None 을 돌려줌.
