@@ -31,8 +31,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      # 요약이 이번 실행의 collect_run 행만 고르는 기준
+      #   - start_run 의 started_at 과 같은 러너 시계
+      - name: 수집 시작 시각 기록
+        run: echo "COLLECT_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       # collect.py 는 표준 라이브러리만 사용. pip install 스텝 불필요
       - name: 최근 3개월 재수집
+        id: collect
         # 신고 기한이 계약일로부터 30일. 최근 1~2개월은 항상 과소집계
         # 매일 같은 구간 재수신으로 신고 지연분 보충, 정정/해제 이력 축적
         env:
@@ -42,6 +47,34 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python3 scripts/collect.py --recent-months 3
+      # 수집이 돌았으면 성공, 실패 모두 표를 남김
+      #   - tee: Summary 탭과 실행 로그 양쪽에서 확인
+      #   - shell: bash 는 pipefail 을 켬
+      #   - 없으면 요약 명령이 실패해도 tee 때문에 성공으로 보임
+      - name: 실행 요약
+        if: always() && steps.collect.conclusion != 'skipped'
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/collect.py --summary-since "$COLLECT_STARTED_AT" | tee -a "$GITHUB_STEP_SUMMARY"
+      # failure() 만 쓰지 않는 이유
+      #   - 앞선 어느 스텝이 실패해도 참
+      #   - 요약 스텝 실패를 수집 실패로 알리게 됨
+      # 알림 문구를 env 로 넘기는 이유
+      #   - run 안에 두면 Semgrep 의 bash 해석이 이 한글 문구에서 깨짐
+      #   - 일부만 해석된 파일은 ci.yml 의 --strict 에 걸려 CI 가 실패
+      - name: 실패 구간 알림
+        if: failure() && steps.collect.conclusion == 'failure'
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ALERT_TITLE: 수집 실패
+          ALERT_MESSAGE: 실패한 구간과 에러 코드는 이 실행의 Summary 에 있다
+        run: |
+          python3 scripts/collect.py --failures-since "$COLLECT_STARTED_AT" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=$ALERT_TITLE::$ALERT_MESSAGE"
 
   # 60일 무커밋 시 스케줄 워크플로가 자동 비활성화되는 것 방어
   # collect 와 분리한 이유
