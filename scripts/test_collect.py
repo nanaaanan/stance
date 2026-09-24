@@ -309,5 +309,87 @@ class TotalCountTest(unittest.TestCase):
                 self.assertEqual([call.args[3] for call in fetch.call_args_list], [1, 2])
 
 
+class RunSummaryTest(unittest.TestCase):
+    @staticmethod
+    def run_row(status="ok", total=10, ins=0, upd=0, same=10, code=None):
+        return {
+            "kind": "trade", "lawd_cd": "11680", "deal_ym": "202607", "status": status,
+            "total_count": total, "inserted_count": ins, "updated_count": upd,
+            "unchanged_count": same, "error_code": code,
+            "started_at": "2026-09-24T20:17:00+00:00",
+            "finished_at": "2026-09-24T20:17:30+00:00",
+        }
+
+    def test_zero_unknown_and_rerun_are_counted_apart(self):
+        rows = [
+            self.run_row(total=0, same=0),
+            self.run_row(total=None, same=0),
+            self.run_row(total=10, same=10),
+            self.run_row(total=5, ins=2, upd=1, same=2),
+        ]
+        text = collect.summarize_runs(rows, total=len(rows))
+        self.assertIn("| trade | 4 | 0 | 0 | 1 | 1 | 2 | 1 | 12 | 30 |", text)
+
+    def test_failure_table_hides_unsafe_codes(self):
+        rows = [
+            self.run_row(status="running"),
+            self.run_row(status="error", code=""),
+            self.run_row(status="error", code="22"),
+            self.run_row(status="error", code="x\n::error::y | https://example.com/?k=1"),
+            self.run_row(status="error", code="AREA_PRECISION"),
+            self.run_row(status="error", code="aB3" * 10 + "xY"),
+        ]
+        text = collect.failed_runs_table(rows, total=len(rows))
+        for expected in ("(끝나지 않음)", "(코드 없음)", "| 22 |", "| AREA_PRECISION |", "(형식 밖 코드)"):
+            self.assertIn(expected, text)
+        for leaked in ("example.com", "::error", "\nx", "aB3"):
+            self.assertNotIn(leaked, text)
+
+    def test_error_msg_is_never_selected(self):
+        self.assertNotIn("error_msg", collect.RUN_SUMMARY_SELECT)
+
+    def test_empty_and_partial_reads_are_reported(self):
+        self.assertIn("기록된 구간이 없다", collect.summarize_runs([], total=0))
+        self.assertIn("전체 2, 읽은 0", collect.summarize_runs([], total=2))
+        self.assertIn("전체 3, 읽은 1", collect.summarize_runs([self.run_row()], total=3))
+        failures = collect.failed_runs_table([self.run_row()], total=4)
+        self.assertIn("기록된 실패 구간이 없다", failures)
+        self.assertIn("전체 4, 읽은 1", failures)
+
+    def test_missing_counts_are_not_shown_as_zero(self):
+        row = self.run_row()
+        row["inserted_count"] = None
+        self.assertIn("행 수 기록이 비어 있는 성공 구간 1개", collect.summarize_runs([row], total=1))
+
+    def test_non_list_response_is_a_read_error(self):
+        cfg = collect.CollectConfig(key="", dry_run=False)
+        with mock.patch.object(collect, "_sb_request", return_value=None):
+            with self.assertRaises(ValueError):
+                collect.fetch_runs_since("2026-09-24T20:17:00Z", cfg)
+
+    def test_summary_mode_survives_db_error_without_service_key(self):
+        env = {"SUPABASE_URL": "http://localhost", "SUPABASE_SERVICE_ROLE_KEY": "test"}
+        argv = ["collect.py", "--summary-since", "2026-09-24T20:17:00Z"]
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(collect, "_sb_request", side_effect=collect.SupabaseError(500, "x")),
+            contextlib.redirect_stdout(stdout),
+        ):
+            collect.main()
+        self.assertIn("status=500", stdout.getvalue())
+
+    def test_empty_since_does_not_start_collection(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["collect.py", "--summary-since", ""]),
+            mock.patch.object(collect, "_get_key", side_effect=AssertionError("수집 모드로 넘어감")),
+            contextlib.redirect_stdout(stdout),
+        ):
+            collect.main()
+        self.assertIn("시작 시각이 비어 있거나", stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

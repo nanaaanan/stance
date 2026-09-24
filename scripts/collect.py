@@ -38,6 +38,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -921,6 +922,134 @@ def collect_one(kind: str, lawd_cd: str, deal_ym: str, cfg: CollectConfig,
     }
 
 
+# ============================== 실행 요약 ==============================
+# error_msg 는 고르지 않음
+#   - 응답 본문 일부가 들어 있을 수 있음
+#   - Actions 로그는 공개
+RUN_SUMMARY_SELECT = ("kind,lawd_cd,deal_ym,status,total_count,inserted_count,"
+                      "updated_count,unchanged_count,error_code,started_at,finished_at")
+# error_code 는 외부 응답의 resultCode 에서 옴
+#   - 공개 로그에 키나 본문 일부가 새지 않게 두 모양만 그대로 출력
+#   - 숫자 3자리 이하: API 결과 코드, HTTP 상태
+#   - 대문자와 밑줄: 이 파일이 만드는 코드 (AREA_PRECISION 등)
+SAFE_CODE = re.compile(r"[0-9]{1,3}|[A-Z][A-Z_]{1,39}")
+
+
+def fetch_runs_since(since: str, cfg: CollectConfig) -> tuple:
+    """since 이후 시작한 collect_run 행과, 같은 조건의 전체 행 수."""
+    where = f"started_at=gte.{quote(since, safe='')}"
+    rows = _sb_request("GET", f"collect_run?select={RUN_SUMMARY_SELECT}&{where}&order=id",
+                       cfg.sb_url, cfg.sb_key)
+    # 빈 본문(None)을 빈 목록으로 바꾸지 않음
+    #   - 조회 이상이 "기록 0개" 로 보이게 됨
+    if not isinstance(rows, list):
+        raise ValueError("collect_run 응답이 목록이 아님")
+    return rows, _sb_count(f"collect_run?select=id&{where}", cfg)
+
+
+def _safe_code(code) -> str:
+    if not code:
+        return "(코드 없음)"
+    return code if SAFE_CODE.fullmatch(code) else "(형식 밖 코드)"
+
+
+def _partial_read_note(rows: list, total: int) -> list:
+    if total == len(rows):
+        return []
+    return [f"- 전체 행 수와 읽은 행 수가 다르다 (전체 {total}, 읽은 {len(rows)}). 일부만 셌을 수 있다"]
+
+
+def summarize_runs(rows: list, total: int) -> str:
+    """종류별 구간 수와 행 수를 마크다운 표로."""
+    lines = ["### 수집 실행 요약", ""]
+    if not rows:
+        lines.append("시작 시각 이후 기록된 구간이 없다. 같은 UTC 날 이미 성공해 건너뛰었거나 "
+                     "기록 자체가 실패했을 수 있다. 수집 로그의 '오늘 이미 성공 N건 건너뜀' 과 "
+                     "'[경고] collect_run' 줄로 가른다.")
+        lines += _partial_read_note(rows, total)
+        return "\n".join(lines) + "\n"
+
+    lines += ["| 종류 | 성공 | 실패 | 끝나지 않음 | 0건 응답 | 총건수 미확인 "
+              "| 신규 행 | 갱신 행 | 안 바뀐 행 | 소요 초 |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    count_fields = ("inserted_count", "updated_count", "unchanged_count")
+    missing_counts = 0
+    for kind in ("trade", "rent"):
+        mine = [r for r in rows if r["kind"] == kind]
+        if not mine:
+            continue
+        ok = [r for r in mine if r["status"] == "ok"]
+        missing_counts += sum(any(r[f] is None for f in count_fields) for r in ok)
+        ends = [datetime.fromisoformat(r["finished_at"]) for r in mine if r["finished_at"]]
+        seconds = "-"
+        if ends:
+            start = min(datetime.fromisoformat(r["started_at"]) for r in mine)
+            seconds = round((max(ends) - start).total_seconds())
+        inserted, updated, unchanged = (sum(r[f] or 0 for r in ok) for f in count_fields)
+        cells = [
+            len(ok),
+            sum(r["status"] == "error" for r in mine),
+            sum(r["status"] == "running" for r in mine),
+            # 0 과 NULL 은 다른 관측
+            #   - NULL 은 200 을 받았지만 총건수를 읽지 못한 구간
+            sum(r["total_count"] == 0 for r in ok),
+            sum(r["total_count"] is None for r in ok),
+            inserted, updated, unchanged, seconds,
+        ]
+        lines.append(f"| {kind} | " + " | ".join(str(c) for c in cells) + " |")
+
+    lines += ["",
+              "- 성공부터 총건수 미확인까지는 구간 수다. 구간은 (구, 계약월) 하나. "
+              "시작 시각 이후 기록된 구간을 센다",
+              "- 0건 응답은 200 응답의 총건수가 0 인 구간, 총건수 미확인은 총건수를 읽지 못한 구간이다. "
+              "신규와 갱신이 0 이어도 안 바뀐 행이 있으면 정상 재수집이다"]
+    if missing_counts:
+        lines.append(f"- 행 수 기록이 비어 있는 성공 구간 {missing_counts}개. 행 칸 합계에서 빠졌다")
+    lines += _partial_read_note(rows, total)
+    return "\n".join(lines) + "\n"
+
+
+def failed_runs_table(rows: list, total: int) -> str:
+    """실패하거나 끝나지 않은 구간과 에러 코드."""
+    bad = [r for r in rows if r["status"] != "ok"]
+    lines = ["### 실패한 구간", ""]
+    if not bad:
+        lines.append("기록된 실패 구간이 없다. 수집이 첫 구간을 시작하기 전에 멈췄거나 "
+                     "기록이 실패했다. 수집 스텝 로그를 본다.")
+    else:
+        lines += ["| 종류 | 구 | 계약월 | 에러 코드 |", "| --- | --- | --- | --- |"]
+        for r in bad:
+            code = "(끝나지 않음)" if r["status"] == "running" else _safe_code(r["error_code"])
+            lines.append(f"| {r['kind']} | {r['lawd_cd']} | {r['deal_ym']} | {code} |")
+    lines += _partial_read_note(rows, total)
+    return "\n".join(lines) + "\n"
+
+
+def print_run_summary(since: str, failures_only: bool) -> None:
+    """Actions 요약 스텝용 출력.
+
+    서비스키 없이 collect_run 만 읽음
+    DB 를 읽지 못하면 예외 대신 한 줄만 남김
+      - 요약 스텝이 실패하면 수집이 성공한 날에도 run 이 빨개짐
+    """
+    try:
+        datetime.fromisoformat(since)
+    except ValueError:
+        print("요약을 만들지 못했다. 시작 시각이 비어 있거나 형식이 틀렸다")
+        return
+    cfg = CollectConfig(key="", dry_run=False)
+    cfg.sb_url, cfg.sb_key = _sb_config()
+    try:
+        rows, total = fetch_runs_since(since, cfg)
+    except SupabaseError as e:
+        print(f"요약을 만들지 못했다. collect_run 조회 실패 status={e.status}")
+        return
+    except ValueError:
+        print("요약을 만들지 못했다. collect_run 응답을 읽지 못했다")
+        return
+    print(failed_runs_table(rows, total) if failures_only else summarize_runs(rows, total))
+
+
 # ============================== CLI ==============================
 def _load_districts() -> dict:
     data = json.loads(DISTRICTS_PATH.read_text(encoding="utf-8"))
@@ -972,7 +1101,16 @@ def main():
     ap.add_argument("--no-resume", action="store_true", help="오늘 이미 성공한 것도 다시 받기")
     ap.add_argument("--save-raw", action="store_true",
                     help="검사를 통과한 원본 응답을 scripts/raw/{kind}/ 에 저장")
+    ap.add_argument("--summary-since", help="이 UTC 시각 이후 collect_run 요약만 출력 (Actions 요약 스텝)")
+    ap.add_argument("--failures-since", help="이 UTC 시각 이후 실패 구간만 출력 (Actions 실패 스텝)")
     args = ap.parse_args()
+
+    # 빈 문자열도 요약 모드로 보냄
+    #   - 시작 시각 기록이 빠진 날 수집 모드로 넘어가면 안 됨
+    since = args.failures_since if args.failures_since is not None else args.summary_since
+    if since is not None:
+        print_run_summary(since, failures_only=args.failures_since is not None)
+        return
 
     key       = _get_key()
     months    = _resolve_months(args)
