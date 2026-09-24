@@ -1,10 +1,11 @@
 # 실거래 원장 스키마
 
-국토교통부 아파트 실거래 API 응답을 담는 4개 테이블과 수집 건수 변화 이력 뷰 1개.
+국토교통부 아파트 실거래 API 응답과 단지 마스터를 담는 6개 테이블, 수집 건수 변화 이력 뷰 1개.
 
 |                     |                                                         |
 | ------------------- | ------------------------------------------------------- |
 | DDL                 | `supabase/migrations/20260818104853_deal_tables.sql`    |
+| 단지 마스터 DDL     | `supabase/migrations/20260922115132_complex_master_tables.sql` |
 | 수집 건수 이력 뷰 DDL | `supabase/migrations/20260906092758_collect_count_history_view.sql` |
 | 설계 근거가 된 실측 | `data/recon-summary.md`                                 |
 | API 호출 예시       | `docs/api/molit-trade.http`, `docs/api/molit-rent.http` |
@@ -38,7 +39,7 @@
 
 <br/>
 
-## 테이블 4개와 관계
+## 테이블 6개와 관계
 
 ```
                   수집 배치 (Python)
@@ -68,6 +69,8 @@
 | ----------------- | ------------------------------- | -------------------------- |
 | `trade`           | 매매 거래 1건의 **현재 상태**   | 같은 거래는 그 행을 고침   |
 | `rent`            | 전월세 계약 1건의 **현재 상태** | 같은 계약은 그 행을 고침   |
+| `complex`         | 단지 1개                         | 같은 단지는 그 행을 고침   |
+| `complex_area`    | 단지의 실거래 면적 1개           | 같은 단지와 면적은 그 행을 고침 |
 | `deal_change_log` | 값이 바뀐 순간 1회              | 안 바뀌면 아무것도 안 쌓임 |
 | `collect_run`     | 수집 시도 1회                   | 덮어쓰지 않고 계속 쌓임    |
 
@@ -87,7 +90,7 @@
 
 같은 단지의 매매와 전월세를 연결할 때는 `apt_seq` 를 쓴다. 양쪽 응답 모두 이 값을 주고, 강남구 실측에서 빠진 행이 0건이었다.
 
-단지 관리정보(세대수, 좌표 등)는 서울시 공동주택 CSV 에 있는데, 그쪽은 `aptSeq` 가 없어서 **도로명 주소로만** 붙인다. 단지명이나 지번으로 붙이면 엉뚱한 단지에 잘못 매칭된다. 관련 테이블은 아직 만들지 않았다.
+단지 관리정보는 `complex` 와 `complex_area` 에 둔다. K-apt 쪽에는 `aptSeq` 가 없어서 도로명 조인 키로 연결한 결과를 저장한다. 단지명이나 지번은 조인 키로 쓰지 않는다.
 
 <br/>
 
@@ -222,6 +225,45 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 | `umd_cd`         | 전월세 응답에 없다                     |
 | 해제/직거래 관련 | 필드 자체가 없다                       |
 | `is_jeonse`      | `monthly_rent = 0` 과 같은 말이라 중복 |
+
+### complex
+
+화면이 읽는 단지 마스터다. 한 행은 `apt_seq` 로 식별되는 단지 하나를 뜻한다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `apt_seq` | `text` | PK. `trade` / `rent` 의 `apt_seq` 와 같은 값 |
+| `sgg_cd` | `text` | 이 단지의 거래가 가장 많이 조회된 구. 단지가 속한 구라는 뜻은 아님 |
+| `apt_nm` | `text` | 사람에게 보여 주는 단지명. 조인 키가 아님 |
+| `road_key` | `text` | K-apt 매칭에 사용한 도로명 조인 키. 없으면 NULL |
+| `kapt_code` | `text` | K-apt 단지 코드. 없으면 NULL. 유일하지 않음 |
+| `kapt_key` | `text` | 매칭 사전에 실제로 있던 키. 없으면 NULL |
+| `match_source` | `text` | 어느 경로로 매칭됐는지. 없으면 NULL |
+| `first_seen_at` `last_seen_at` | `timestamptz` | 처음 본 시각 / 마지막으로 본 시각 |
+
+`kapt_code`, `kapt_key`, `match_source` 는 셋이 모두 채워지거나 모두 NULL 이어야 한다. `road_key` 를 포함한 nullable 문자열에는 빈 문자열을 저장하지 않는다.
+
+PK 외의 조회용 인덱스는 아직 만들지 않았다. 화면 쿼리가 확정된 뒤 실제 조회 조건에 맞춰 추가한다.
+
+### complex_area
+
+단지의 실거래 전용면적과 K-apt 면적 그룹의 대응이다. 한 행은 `(apt_seq, exclu_use_ar)` 하나를 뜻한다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `apt_seq` | `text` | PK 첫 칸. `complex(apt_seq)` 를 참조하며 삭제는 제한 |
+| `exclu_use_ar` | `numeric(9,4)` | PK 둘째 칸. 실거래 전용면적 |
+| `area_status` | `text` | `면적 매칭`, `면적 ±0.5㎡ 밖`, `면적 동점(모호)`, `K-apt 면적정보 없음` 중 하나 |
+| `kapt_area` | `numeric(9,4)` | 할당된 K-apt 면적. 매칭되지 않았으면 NULL |
+| `households` | `integer` | 해당 K-apt 면적의 세대수. 없으면 NULL |
+| `group_id` | `text` | 그룹 안의 최소 면적 문자열. `±0.5㎡ 밖` 또는 `동점(모호)`이면 NULL |
+| `group_label` | `integer` | 화면 표시용 정수 라벨. 계산에는 사용하지 않음 |
+| `group_areas` | `text` | 그룹 구성 면적을 오름차순 `\|` 로 연결한 문자열 |
+| `first_seen_at` `last_seen_at` | `timestamptz` | 처음 본 시각 / 마지막으로 본 시각 |
+
+면적과 세대수는 함께 채워지고, 그룹 칸 3개도 함께 채워지거나 함께 NULL 이어야 한다. 면적, 세대수, 그룹 라벨은 값이 있으면 0보다 커야 한다.
+
+PK의 선두 칸이 `apt_seq` 이므로 별도 `apt_seq` 인덱스는 만들지 않았다.
 
 ### collect_run
 
@@ -519,10 +561,11 @@ trg_rent_keep_filled
 | 테이블                          | 브라우저 (anon / authenticated) | 수집 스크립트 (service_role) |
 | ------------------------------- | ------------------------------- | ---------------------------- |
 | `trade` `rent`                  | 읽기만                          | 읽기, 넣기, 고치기           |
+| `complex` `complex_area`        | 읽기만                          | 읽기, 넣기, 고치기           |
 | `deal_change_log` `collect_run` | 접근 불가                       | 읽기, 넣기, 고치기           |
 | `collect_count_history` (뷰)    | 접근 불가                       | 읽기만                      |
 
-- RLS 는 4개 테이블 모두 켠다. `trade`/`rent` 에만 전체 읽기 정책을 둔다
+- RLS 는 6개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area` 에만 전체 읽기 정책을 둔다
 - `anon` 을 넣는 이유: 익명 세션 발급이 끝나기 전에 데이터를 요청하는 구간이 있고, 그때 역할은 `authenticated` 가 아니라 `anon` 이다
 - 수집 스크립트에 **DELETE 를 주지 않는다.** 이 설계는 upsert 와 표시만 쓰므로 지울 일이 없다. 권한이 없으면 실수도 없다
 - Supabase 는 새 테이블에 권한을 자동으로 주므로 `revoke` 를 먼저 하고 `grant` 한다. `grant` 는 더하기만 하기 때문이다
@@ -707,13 +750,15 @@ DB 에 표시를 남기는 비용은 컬럼 하나뿐이고, 대신 나중에 "�
 
 ### 단지 정보가 두 곳에 있을 때 어느 쪽이 진실인가
 
-`trade` 에는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year`, `umd_nm`)이 **거래 행마다 반복해서** 들어 있다. 나중에 단지 마스터 테이블이 생기면 같은 사실이 두 곳에 존재하게 된다.
+`trade` / `rent` 에는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year`, `umd_nm` 등)이 **거래 행마다 반복해서** 들어 있다. 같은 사실이 거래 행과 `complex` 두 곳에 존재한다.
+
+`trade` / `rent` 에 남는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year` 등)은 **그 시점 응답의 원본 스냅샷**이고, **화면이 읽는 것은 항상 `complex` 다.**
 
 | 어디                 | 무엇인가                       | 화면이 읽나 |
 | -------------------- | ------------------------------ | ----------- |
-| `trade` 의 단지 속성 | 그 시점 응답의 **원본 스냅샷** | 아니오      |
-| 단지 마스터 (예정)   | 화면이 읽는 **유일한 곳**      | 예          |
+| `trade` / `rent` 의 단지 속성 | 그 시점 응답의 **원본 스냅샷** | 아니오      |
+| `complex`                     | 화면이 읽는 **유일한 곳**      | 예          |
 
-중복이지만 `trade` 쪽을 지우지 않는다. 매일 다시 수집하면 **마스터에 없는 `apt_seq` 가 들어오는데**, 그때 그 단지 정보의 유일한 출처가 거래 행이기 때문이다. 새 단지를 찾는 것도 `수집된 apt_seq 집합 - 마스터의 apt_seq 집합` 한 줄이면 끝난다.
+중복이지만 `trade` / `rent` 쪽을 지우지 않는다. 매일 다시 수집하면 **마스터에 없는 `apt_seq` 가 들어오는데**, 그때 그 단지 정보의 유일한 출처가 거래 행이기 때문이다.
 
-단지 마스터의 상세 설계는 그 테이블을 만들 때 정한다.
+`complex` 에 아직 없는 새 `apt_seq` 는 `수집된 apt_seq 집합 - complex의 apt_seq 집합`으로 찾는다. 별도 감지 상태나 임계값을 만들지 않는다.
