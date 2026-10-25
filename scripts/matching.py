@@ -10,10 +10,13 @@ road_key 를 바꿀 때는 scripts/recon.py 의 road_key 와 반환 문자열을
     python3 scripts/matching.py
 """
 
+import argparse
 import collections
 import csv
 import hashlib
 import importlib.util
+import io
+import json
 import pathlib
 import sys
 from decimal import Decimal, InvalidOperation
@@ -321,5 +324,221 @@ def report_normalization_contribution():
         sys.exit("[중단] 기여 측정 결과와 운영 정규화 변형이 다릅니다.")
 
 
+REB_CSV_PATH = ROOT / "data" / "reb-complex-seoul-apt.csv"
+REB_CSV_SHA256 = "a2ddd592d2a720ae5e2e80457aaa9302f0e4d771f08b157bcfc7bd7a769a9346"
+ACTIVE_REB_NORMALIZATION_VARIANTS = ()
+
+
+def reb_key(address, normalization_variants=()):
+    """명부 도로명주소에 지정된 기존 변형만 적용."""
+    raw = str(address or "").strip()
+    if not normalization_variants:
+        return raw
+    split_at = max(raw.rfind(" "), raw.rfind("\u3000"))
+    if split_at < 0:
+        return raw
+    road, separator, detail = raw[:split_at], raw[split_at], raw[split_at + 1:]
+    rn, de = _normalize_kapt_parts(road, detail, normalization_variants)
+    if 1 not in normalization_variants:
+        # - Restore whitespace stripped by the shared normalizer.
+        trailing = road[len(road.rstrip()):]
+        leading = detail[:len(detail) - len(detail.lstrip())]
+        if 4 in normalization_variants:
+            trailing = trailing.replace("\u3000", " ")
+            leading = leading.replace("\u3000", " ")
+        rn += trailing
+        de = leading + de
+    if 4 in normalization_variants:
+        separator = separator.replace("\u3000", " ")
+    return rn + separator + de
+
+
+class RebIndex:
+    """SHA-256 검증을 통과한 원본에서 변형별 구 사전 생성."""
+
+    def __init__(self, path=REB_CSV_PATH, expected_sha256=REB_CSV_SHA256):
+        try:
+            content = pathlib.Path(path).read_bytes()
+        except OSError as exc:
+            sys.exit(f"[중단] 명부 읽기 실패: {exc}")
+        if (len(expected_sha256) != 64
+                or hashlib.sha256(content).hexdigest() != expected_sha256):
+            sys.exit("[중단] 명부 SHA-256 불일치. 변형 기여를 다시 측정하라.")
+        try:
+            reader = csv.DictReader(io.StringIO(content.decode("cp949"), newline=""))
+            required = {"단지고유번호", "도로명주소", "단지명_공시가격", "사용승인일"}
+            if not required.issubset(reader.fieldnames or ()):
+                sys.exit("[중단] 명부 필수 헤더 없음.")
+            rows = list(reader)
+        except (UnicodeDecodeError, csv.Error) as exc:
+            sys.exit(f"[중단] 명부 cp949 또는 CSV 읽기 실패: {exc}")
+        with open(ROOT / "config" / "districts.json", encoding="utf-8") as f:
+            districts = {item["code"]: item["name"] for item in json.load(f)["districts"]}
+        self._rows = []
+        for row in rows:
+            complex_id = str(row.get("단지고유번호") or "").strip()
+            if len(complex_id) != 14 or not complex_id.isascii() or not complex_id.isdigit():
+                sys.exit(f"[중단] 명부 단지고유번호 형식 오류: {complex_id!r}")
+            code = complex_id[:5]
+            if code not in districts:
+                sys.exit(f"[중단] 명부 구 코드 없음: {code}")
+            self._rows.append((districts[code], complex_id, reb_key(row.get("도로명주소"))))
+        self.source_rows = len(rows)
+        self.key_rows = sum(bool(address) for _, _, address in self._rows)
+        counts = collections.Counter((gu, address) for gu, _, address in self._rows if address)
+        self.duplicate_keys = sum(count > 1 for count in counts.values())
+        self.duplicate_rows = sum(count for count in counts.values() if count > 1)
+        self._indexes = {}
+
+    def lookup(self, gu_names, key, normalization_variants=()):
+        variants = tuple(sorted(set(normalization_variants)))
+        if any(number not in NORMALIZATION_NAMES for number in variants):
+            raise ValueError("허용되지 않은 명부 변형")
+        if variants not in self._indexes:
+            by_gu = collections.defaultdict(dict)
+            for gu, complex_id, address in self._rows:
+                normalized = reb_key(address, variants)
+                if normalized:
+                    by_gu[gu].setdefault(normalized, set()).add(complex_id)
+            self._indexes[variants] = by_gu
+        candidates = set()
+        if key:
+            for gu in gu_names:
+                candidates.update(self._indexes[variants].get(gu, {}).get(key, ()))
+        return candidates
+
+
+def match_reb(index, gu_names, key, active_variants=None, *, raw_first=True):
+    """원문 우선 판정 또는 충돌 관측에 같은 후보 조회 사용."""
+    if active_variants is None:
+        active_variants = ACTIVE_REB_NORMALIZATION_VARIANTS
+    variants = tuple(sorted(set(active_variants)))
+    attempts = [((), "원문 일치")] if raw_first else []
+    attempts.extend(((number,), f"변형 {number} 적용 후 일치") for number in variants)
+    if len(variants) > 1:
+        label = "+".join(str(number) for number in variants)
+        attempts.append((variants, f"변형 {label} 적용 후 일치"))
+    if not raw_first:
+        attempts = [(variants, "")]
+    candidates = set()
+    source = ""
+    for enabled, label in attempts:
+        found = index.lookup(gu_names, key, enabled)
+        if found and not candidates:
+            source = label
+        candidates.update(found)
+        if raw_first and not enabled and found:
+            break
+    matched = len(candidates) == 1
+    return {
+        "reb_complex_id": next(iter(candidates)) if matched else "",
+        "reb_match_source": source if matched else "",
+        "candidates": frozenset(candidates),
+        "fail_reason": ("" if matched else "도로명 키 생성 불가" if not key else
+                        "후보 2개 이상(모호)" if candidates else "후보 없음"),
+    }
+
+
+def match_reb_complex(index, gu_names, rows, representative, active_variants=None,
+                      *, raw_first=True):
+    head = representative(rows)
+    key = road_key(head.get("road_nm"), head.get("road_nm_bonbun"),
+                   head.get("road_nm_bubun"))
+    return match_reb(index, gu_names, key, active_variants, raw_first=raw_first)
+
+
+def measure_reb_contribution(index, trade_rows, representative, active_variants=None,
+                             variant_order=(1, 2, 3, 4)):
+    if active_variants is None:
+        active_variants = ACTIVE_REB_NORMALIZATION_VARIANTS
+    if set(variant_order) != set(NORMALIZATION_NAMES) or len(variant_order) != 4:
+        raise ValueError("네 변형을 각각 한 번씩 측정해야 함")
+    grouped = collections.defaultdict(list)
+    for row in trade_rows:
+        grouped[row["apt_seq"]].append(row)
+    gu_names = {apt: {row["_district_name"] for row in rows}
+                for apt, rows in grouped.items()}
+
+    def evaluate(variants, raw_first=True):
+        return {apt: match_reb_complex(index, gu_names[apt], rows, representative,
+                                      variants, raw_first=raw_first)
+                for apt, rows in grouped.items()}
+
+    def states(results):
+        return {apt: ("matched" if result["reb_complex_id"] else
+                      "ambiguous" if len(result["candidates"]) > 1 else "unmatched",
+                      sum(row["trade_count"] for row in grouped[apt]))
+                for apt, result in results.items()}
+
+    baseline = evaluate(())
+    baseline_states = states(baseline)
+    results = {}
+    for label, variants in [*((n, (n,)) for n in variant_order),
+                            ("final", tuple(active_variants))]:
+        compared = evaluate(variants)
+        observed = evaluate(variants, raw_first=False)
+        result = _contribution(baseline_states, states(compared))
+        result["conflict_apts"] = sorted(
+            apt for apt in baseline if baseline[apt]["candidates"]
+            and baseline[apt]["candidates"] != observed[apt]["candidates"])
+        result["conflicts"] = len(result["conflict_apts"])
+        results[label] = result
+    return {
+        "total": len(grouped),
+        "baseline": sum(bool(result["reb_complex_id"]) for result in baseline.values()),
+        "results": results,
+        "eligible": tuple(sorted(n for n in variant_order if results[n]["new"] > 0
+                                 and results[n]["lost"] == 0
+                                 and results[n]["conflicts"] == 0)),
+    }
+
+
+def _load_local_crosswalk():
+    spec = importlib.util.spec_from_file_location("_stance_reb_crosswalk", HERE / "crosswalk.py")
+    if spec is None or spec.loader is None:
+        sys.exit("[중단] crosswalk.py 로드 실패.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def report_reb_normalization_contribution():
+    index = RebIndex()
+    crosswalk = _load_local_crosswalk()
+    url, api_key = _load_local_coverage().sb_config()
+    trade_rows = []
+    for code, name in crosswalk.load_districts():
+        for row in crosswalk.fetch_district(code, url, api_key):
+            row["_district_name"] = name
+            trade_rows.append(row)
+    measurement = measure_reb_contribution(index, trade_rows, crosswalk.representative)
+    print(f"명부 적재={index.source_rows} 키={index.key_rows} "
+          f"구 안 중복 키={index.duplicate_keys} 중복 행={index.duplicate_rows}")
+    print(f"단지 명부 변형별 단독 기여 (전 기간 is_current, 단지={measurement['total']})")
+    print("항목 | 신규매칭 | 소실매칭 | 신규모호 | 신규매칭분 거래건수 | 매칭 | 충돌")
+    print(f"기준선 | 0 | 0 | 0 | 0 | {measurement['baseline']} | 0")
+    for label in (*NORMALIZATION_NAMES, "final"):
+        result = measurement["results"][label]
+        name = (f"변형 {label} {NORMALIZATION_NAMES[label]}" if label != "final" else
+                f"최종 반영 조합 {list(ACTIVE_REB_NORMALIZATION_VARIANTS)}")
+        print(f"{name} | {result['new']} | {result['lost']} | {result['ambiguous']}"
+              f" | {result['deals']} | {result['matched']} | {result['conflicts']}")
+        if result["lost_apts"]:
+            print(f"{name} 소실 단지: {', '.join(result['lost_apts'])}")
+        if result["conflict_apts"]:
+            print(f"{name} 충돌 단지: {', '.join(result['conflict_apts'])}")
+    print("충돌은 원문 우선 없이 변형 사전만 조회한 관측값.")
+    final = measurement["results"]["final"]
+    if (measurement["eligible"] != ACTIVE_REB_NORMALIZATION_VARIANTS
+            or final["lost"] or final["conflicts"]):
+        sys.exit("[중단] 명부 기여 측정 결과와 운영 변형이 다릅니다.")
+
+
 if __name__ == "__main__":
-    report_normalization_contribution()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--measure-reb", action="store_true")
+    args = parser.parse_args()
+    if args.measure_reb:
+        report_reb_normalization_contribution()
+    else:
+        report_normalization_contribution()
