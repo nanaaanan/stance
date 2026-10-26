@@ -375,6 +375,7 @@ class RebIndex:
         with open(ROOT / "config" / "districts.json", encoding="utf-8") as f:
             districts = {item["code"]: item["name"] for item in json.load(f)["districts"]}
         self._rows = []
+        self.metadata = {}
         for row in rows:
             complex_id = str(row.get("단지고유번호") or "").strip()
             if len(complex_id) != 14 or not complex_id.isascii() or not complex_id.isdigit():
@@ -383,6 +384,10 @@ class RebIndex:
             if code not in districts:
                 sys.exit(f"[중단] 명부 구 코드 없음: {code}")
             self._rows.append((districts[code], complex_id, reb_key(row.get("도로명주소"))))
+            self.metadata[complex_id] = {
+                "name": str(row.get("단지명_공시가격") or "").strip(),
+                "approval_date": str(row.get("사용승인일") or "").strip(),
+            }
         self.source_rows = len(rows)
         self.key_rows = sum(bool(address) for _, _, address in self._rows)
         counts = collections.Counter((gu, address) for gu, _, address in self._rows if address)
