@@ -1,4 +1,4 @@
-"""공시가격 면적 명부와 매매 면적을 매칭해 표시 그룹 CSV 산출.
+"""공시가격 면적 명부와 매매, 전월세 면적을 매칭해 표시 그룹 CSV 산출.
 
 kapt_code는 빈 칸, kapt_area는 명부 면적, households는 unit_count.
 
@@ -229,12 +229,20 @@ def unapproved_tie_apts(current_rows, committed_rows) -> list[tuple[str, Decimal
 
 
 def fetch_trade_rows(sgg_cd: str, url: str, key: str) -> list[dict]:
+    return _fetch_area_rows("trade", sgg_cd, url, key)
+
+
+def fetch_rent_rows(sgg_cd: str, url: str, key: str) -> list[dict]:
+    return _fetch_area_rows("rent", sgg_cd, url, key)
+
+
+def _fetch_area_rows(table: str, sgg_cd: str, url: str, key: str) -> list[dict]:
     """한 구의 전 기간 current 거래에서 면적 조합에 필요한 열만 전부 조회."""
     output = []
     offset = 0
     previous_id = None
     path = (
-        "trade?select=id,apt_seq,exclu_use_ar"
+        f"{table}?select=id,apt_seq,exclu_use_ar"
         f"&sgg_cd=eq.{sgg_cd}&is_current=is.true&order=id"
     )
     while True:
@@ -252,9 +260,9 @@ def fetch_trade_rows(sgg_cd: str, url: str, key: str) -> list[dict]:
         chunk = json.loads(body, parse_float=Decimal)
         for row in chunk:
             if previous_id is not None and row["id"] <= previous_id:
-                raise RuntimeError(f"trade {sgg_cd}: id 엄격 증가 위반: {previous_id} -> {row['id']}")
+                raise RuntimeError(f"{table} {sgg_cd}: id 엄격 증가 위반: {previous_id} -> {row['id']}")
             previous_id = row["id"]
-            required_area(row.get("exclu_use_ar"), f"trade {sgg_cd} id={row['id']}")
+            required_area(row.get("exclu_use_ar"), f"{table} {sgg_cd} id={row['id']}")
         output.extend(chunk)
         if len(chunk) < coverage.PAGE_SIZE:
             return output
@@ -262,12 +270,20 @@ def fetch_trade_rows(sgg_cd: str, url: str, key: str) -> list[dict]:
 
 
 def fetch_all_trade_rows() -> list[dict]:
+    return _fetch_all_area_rows("trade", fetch_trade_rows)
+
+
+def fetch_all_rent_rows() -> list[dict]:
+    return _fetch_all_area_rows("rent", fetch_rent_rows)
+
+
+def _fetch_all_area_rows(table, fetch_rows) -> list[dict]:
     url, key = coverage.sb_config()
     output = []
     for sgg_cd, district_name in coverage.load_districts():
-        rows = fetch_trade_rows(sgg_cd, url, key)
+        rows = fetch_rows(sgg_cd, url, key)
         output.extend(rows)
-        print(f"조회 {sgg_cd} {district_name}: {len(rows):,}행 (누적 {len(output):,})")
+        print(f"조회 {table} {sgg_cd} {district_name}: {len(rows):,}행 (누적 {len(output):,})")
         sys.stdout.flush()
     return output
 
@@ -407,6 +423,41 @@ def build_area_rows(
         "failed_combos_by_apt": failed_combos_by_apt,
     }
     return output, dict(failure_reasons_by_apt), diagnostics
+
+
+def build_combined_area_rows(trade_rows, rent_rows, crosswalk, registry_index):
+    """대응표 안의 매매, 전월세 면적 합집합 산출."""
+    _, trade_combos = _trade_combinations(trade_rows)
+    trade_keys = {(apt, value) for apt, values in trade_combos.items() for value in values}
+    rent_keys = set()
+    included_rent_rows = []
+    outside_apts = set()
+    for row in rent_rows:
+        apt = row.get("apt_seq")
+        if not apt:
+            raise ValueError("rent apt_seq 가 비어 있습니다.")
+        value = required_area(row.get("exclu_use_ar"), f"rent apt_seq={apt}")
+        if apt not in crosswalk:
+            outside_apts.add(apt)
+            continue
+        rent_keys.add((apt, value))
+        included_rent_rows.append(row)
+    combined = trade_rows + included_rent_rows
+    rows, failures, diagnostics = build_area_rows(combined, crosswalk, registry_index)
+    added_keys = rent_keys - trade_keys
+    diagnostics.update({
+        "trade_db_rows": len(trade_rows),
+        "rent_db_rows": len(rent_rows),
+        "trade_combos": len(trade_keys),
+        "rent_combos": len(rent_keys),
+        "rent_outside_apts": len(outside_apts),
+        "added_combos": len(added_keys),
+        "added_status_counts": collections.Counter(
+            row["area_status"] for row in rows
+            if (row["apt_seq"], normalize_area(row["exclu_use_ar"])) in added_keys
+        ),
+    })
+    return rows, failures, diagnostics
 
 
 def _validate_nonarea_failures(rows, crosswalk) -> None:
@@ -701,9 +752,16 @@ def _print_report(rows, failures, crosswalk, registry_index, diagnostics) -> Non
         for row in crosswalk.values()
     )
     group_stats = _group_diagnostics(registry_index, crosswalk, diagnostics)
-    print(f"\n매매 면적 조합: {len(rows):,}행")
+    print(f"\n매매 / 전월세 조회 행: {diagnostics['trade_db_rows']:,} / {diagnostics['rent_db_rows']:,}")
+    print(f"  대응표 밖 전월세 단지: {diagnostics['rent_outside_apts']:,}")
+    print(
+        "  매매 / 전월세(대응표 안) / 합집합 / 전월세만 면적 조합: "
+        f"{diagnostics['trade_combos']:,} / {diagnostics['rent_combos']:,} / "
+        f"{len(rows):,} / {diagnostics['added_combos']:,}"
+    )
     for status in sorted(AREA_STATUSES):
         print(f"  {status}: {statuses[status]:,}")
+        print(f"    전월세만: {diagnostics['added_status_counts'][status]:,}")
     print(f"  실패표 전체 행: {len(failures):,}")
     print(
         "  원본 표기 조합 / 정규화 조합: "
@@ -727,6 +785,7 @@ def _print_report(rows, failures, crosswalk, registry_index, diagnostics) -> Non
     )
     print(f"  명부 그룹 정방향/역방향/셔플 불일치: {group_stats['order_mismatches']:,}")
     print(f"  명부 번호는 있으나 면적 명부 행이 없는 apt_seq: {missing_registry_apts:,}")
+    print(f"  명부 번호가 빈 apt_seq: {sum(not row['reb_complex_id'] for row in crosswalk.values()):,}")
 
     matched_rows = [row for row in rows if row["area_status"] == STATUS_MATCHED]
     source_conflicts = sum(
@@ -766,7 +825,7 @@ def main(
     out_area=COMPLEX_AREA_PATH,
     out_failures=MATCHING_FAILURES_PATH,
 ) -> None:
-    """매매 면적 조합 산출 후 게이트 검사."""
+    """매매, 전월세 면적 조합 산출 후 게이트 검사."""
     try:
         registry_index = load_registry_index(path)
         crosswalk = load_crosswalk()
@@ -778,9 +837,10 @@ def main(
         trade_rows = fetch_all_trade_rows()
         db_apt_sequences = {row["apt_seq"] for row in trade_rows if row.get("apt_seq")}
         _validate_prewrite(crosswalk, db_apt_sequences)
+        rent_rows = fetch_all_rent_rows()
 
-        area_rows, failure_reasons_by_apt, diagnostics = build_area_rows(
-            trade_rows, crosswalk, registry_index
+        area_rows, failure_reasons_by_apt, diagnostics = build_combined_area_rows(
+            trade_rows, rent_rows, crosswalk, registry_index
         )
         failure_rows = build_failure_rows(
             existing_failures, crosswalk, failure_reasons_by_apt
@@ -802,19 +862,15 @@ def main(
         new_tie_apts = unapproved_tie_apts(
             written_area_rows, committed_area_rows
         )
+        _print_report(
+            written_area_rows, written_failure_rows, crosswalk, registry_index, diagnostics,
+        )
         if new_tie_apts:
             print("G4 새 면적 동점 조합:")
             for apt_seq, area in new_tie_apts:
                 print(f"  {apt_seq} {crosswalk[apt_seq]['apt_nm']} {area_text(area)}")
             raise ValueError(f"G4 승인되지 않은 면적 동점 조합 {len(new_tie_apts):,}개")
 
-        _print_report(
-            written_area_rows,
-            written_failure_rows,
-            crosswalk,
-            registry_index,
-            diagnostics,
-        )
         print(f"\n저장: {out_area} ({len(written_area_rows):,}행)")
         print(f"저장: {out_failures} ({len(written_failure_rows):,}행)")
         print("게이트 G2a / G4 / G5a / G5b / G6: 통과")

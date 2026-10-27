@@ -434,6 +434,7 @@ class LayerFailureTest(unittest.TestCase):
                 patch.object(area, "load_failure_rows", return_value=failures),
                 patch.object(area, "load_committed_area_rows", return_value=[]) as committed,
                 patch.object(area, "fetch_all_trade_rows", return_value=trades),
+                patch.object(area, "fetch_all_rent_rows", return_value=[]),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 with self.assertRaisesRegex(SystemExit, "G4"):
@@ -451,6 +452,138 @@ class LayerFailureTest(unittest.TestCase):
         for actual in (set(), {"A"}, {"A", "B", "C"}):
             with self.subTest(actual=actual), self.assertRaisesRegex(ValueError, "G2a"):
                 area._validate_prewrite(self.cross, actual)
+
+
+class RentAreaTest(unittest.TestCase):
+    def setUp(self):
+        self.cross = {"A": fixture_complex("A"), "B": fixture_complex("B")}
+        self.index = {"A": {Decimal("60"): 10, Decimal("61"): 20},
+                      "B": {Decimal("84.5"): 1, Decimal("85.4"): 2}}
+        self.trades = [{"apt_seq": "A", "exclu_use_ar": "60"},
+                       {"apt_seq": "B", "exclu_use_ar": "84.5"}]
+
+    def build(self, rents):
+        return area.build_combined_area_rows(self.trades, rents, self.cross, self.index)
+
+    def test_union_deduplicates_and_preserves_every_trade_column(self):
+        baseline, _, _ = area.build_area_rows(self.trades, self.cross, self.index)
+        rents = [{"apt_seq": "A", "exclu_use_ar": "60.0000"},
+                 {"apt_seq": "A", "exclu_use_ar": "61"},
+                 {"apt_seq": "B", "exclu_use_ar": "85.4"}]
+        rows, _, diagnostics = self.build(rents)
+        by_key = {(row["apt_seq"], row["exclu_use_ar"]): row for row in rows}
+        self.assertEqual(len(rows), 4)
+        for row in baseline:
+            self.assertEqual(by_key[(row["apt_seq"], row["exclu_use_ar"])], row)
+        self.assertEqual(diagnostics["trade_combos"], 2)
+        self.assertEqual(diagnostics["rent_combos"], 3)
+        self.assertEqual(diagnostics["added_combos"], 2)
+        self.assertEqual(diagnostics["added_status_counts"], {area.STATUS_MATCHED: 2})
+        area._validate_output_rows(rows, diagnostics["combos_by_apt"], self.cross, self.index)
+
+    def test_outside_crosswalk_counts_distinct_apts_without_rows(self):
+        rents = [{"apt_seq": apt, "exclu_use_ar": value}
+                 for apt, value in (("X", "60"), ("X", "61"), ("Y", "84.5"))]
+        rows, failures, diagnostics = self.build(rents)
+        self.assertEqual(rows, area.build_area_rows(self.trades, self.cross, self.index)[0])
+        self.assertEqual(failures, {})
+        self.assertEqual(diagnostics["rent_outside_apts"], 2)
+        self.assertEqual(diagnostics["rent_db_rows"], 3)
+        self.assertEqual(diagnostics["rent_combos"], 0)
+
+    def test_rent_only_failures_are_one_per_complex_and_tie_wins(self):
+        rents = [{"apt_seq": apt, "exclu_use_ar": value}
+                 for apt, value in (("A", "62"), ("A", "60.5"), ("B", "90"), ("B", "91"))]
+        rows, reasons, diagnostics = self.build(rents)
+        failures = area.build_failure_rows([], self.cross, reasons)
+        self.assertEqual([(row["apt_seq"], row["fail_layer"], row["fail_reason"])
+                          for row in failures],
+                         [("A", "면적", area.STATUS_TIE), ("B", "면적", area.STATUS_OUTSIDE)])
+        self.assertEqual(diagnostics["added_status_counts"],
+                         {area.STATUS_TIE: 1, area.STATUS_OUTSIDE: 3})
+        area._validate_failure_rows(failures, self.cross, rows)
+        tie = next(row for row in rows if row["area_status"] == area.STATUS_TIE)
+        self.assertTrue(all(tie[key] == "" for key in
+                            ("kapt_area", "households", "group_id", "group_label", "group_areas")))
+
+    def test_rent_precision_is_checked_even_outside_crosswalk(self):
+        for apt in ("A", "X"):
+            with self.subTest(apt=apt), self.assertRaisesRegex(ValueError, "rent.*84.98001"):
+                self.build([{"apt_seq": apt, "exclu_use_ar": "84.98001"}])
+
+    def test_rent_url_and_strict_ids_across_pages(self):
+        import json
+        from urllib.parse import parse_qs, urlsplit
+        for ids in ((1, 2, 3), (1, 1, 3), (2, 1, 3), (1, 2, 2), (1, 2, 1)):
+            responses = []
+            rows = [{"id": id, "apt_seq": "A", "exclu_use_ar": "60"} for id in ids]
+            for chunk in (rows[:2], rows[2:]):
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(chunk).encode()
+                responses.append(response)
+            with self.subTest(ids=ids), patch.object(area.coverage, "PAGE_SIZE", 2), patch.object(
+                    area, "urlopen", side_effect=responses) as fetch:
+                if ids == (1, 2, 3):
+                    self.assertEqual(area.fetch_rent_rows("1", "https://fixture", "key"), rows)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "rent 1: id 엄격 증가 위반"):
+                        area.fetch_rent_rows("1", "https://fixture", "key")
+                for call in fetch.call_args_list:
+                    url = urlsplit(call.args[0].full_url)
+                    self.assertEqual(url.path, "/rest/v1/rent")
+                    query = parse_qs(url.query)
+                    self.assertEqual(query["select"], ["id,apt_seq,exclu_use_ar"])
+                    self.assertEqual(query["is_current"], ["is.true"])
+                    self.assertEqual(query["order"], ["id"])
+                    self.assertEqual(query["sgg_cd"], ["eq.1"])
+                    self.assertNotIn("monthly_rent", query)
+                if ids == (1, 2, 3):
+                    self.assertEqual(parse_qs(urlsplit(fetch.call_args_list[1].args[0].full_url).query)
+                                     ["offset"], ["2"])
+
+    def test_rent_fetch_precision_failure_and_query_failure_propagate(self):
+        import json
+        from urllib.error import URLError
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            [{"id": 1, "apt_seq": "A", "exclu_use_ar": "84.98001"}]).encode()
+        with patch.object(area, "urlopen", return_value=response), self.assertRaisesRegex(
+                ValueError, "rent 1 id=1.*84.98001"):
+            area.fetch_rent_rows("1", "https://fixture", "key")
+        with patch.object(area, "urlopen", side_effect=URLError("fixture DNS failure")), self.assertRaisesRegex(
+                RuntimeError, "Supabase 조회 실패.*fixture DNS failure"):
+            area.fetch_rent_rows("1", "https://fixture", "key")
+
+    def test_main_g2a_uses_trade_only_and_rent_failure_keeps_files(self):
+        rents = [{"apt_seq": "X", "exclu_use_ar": "60"},
+                 {"apt_seq": "A", "exclu_use_ar": "61"}]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [pathlib.Path(directory) / name for name in ("area.csv", "fail.csv")]
+            with (
+                patch.object(area, "load_registry_index", return_value=self.index),
+                patch.object(area, "load_crosswalk", return_value=self.cross),
+                patch.object(area, "load_failure_rows", return_value=[]),
+                patch.object(area, "load_committed_area_rows", return_value=[]),
+                patch.object(area, "fetch_all_trade_rows", return_value=self.trades) as trades,
+                patch.object(area, "fetch_all_rent_rows", return_value=rents) as rent,
+                patch.object(area, "_validate_prewrite", wraps=area._validate_prewrite) as gate,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                area.main(out_area=paths[0], out_failures=paths[1])
+                gate.assert_called_once_with(self.cross, {"A", "B"})
+                before = [path.read_bytes() for path in paths]
+                self.assertEqual({row["apt_seq"] for row in area._read_csv(paths[0])}, {"A", "B"})
+                area.main(out_area=paths[0], out_failures=paths[1])
+                self.assertEqual([path.read_bytes() for path in paths], before)
+                rent.side_effect = RuntimeError("fixture rent failure")
+                with self.assertRaisesRegex(SystemExit, "fixture rent failure"):
+                    area.main(out_area=paths[0], out_failures=paths[1])
+                self.assertEqual([path.read_bytes() for path in paths], before)
+                rent.side_effect = None
+                trades.return_value = self.trades[:1]
+                with self.assertRaisesRegex(SystemExit, "G2a"):
+                    area.main(out_area=paths[0], out_failures=paths[1])
+                self.assertEqual([path.read_bytes() for path in paths], before)
 
 
 if __name__ == "__main__":
