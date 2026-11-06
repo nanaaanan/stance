@@ -1,3 +1,6 @@
+"""단지 마스터 적재 계약과 실패 시 DB 쓰기 차단 확인"""
+
+import copy
 import csv
 import hashlib
 import io
@@ -14,6 +17,29 @@ from scripts import load_complex
 
 
 class LoadComplexTest(unittest.TestCase):
+    def setUp(self):
+        registry = [{"reb_complex_id": "11110100000001", "households": 10, "approval_date": "2000-01-01"}]
+        registry_patch = patch.object(
+            load_complex, "load_reb_complex",
+            return_value=(registry, {"households": 0, "approval_date": 0}),
+        )
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
+        def failures():
+            crosswalk, _ = load_complex.load_inputs()
+            return [
+                {"apt_seq": row["apt_seq"], "fail_layer": layer, "fail_reason": reason}
+                for row in crosswalk
+                for layer, reason, column in (
+                    ("단지 명부", "후보 없음", "reb_complex_id"),
+                    ("관리정보", "K-apt 마스터에 없음", "kapt_code"),
+                )
+                if row.get(column) is None
+            ]
+        failures_patch = patch.object(load_complex, "load_failures", side_effect=failures)
+        failures_patch.start()
+        self.addCleanup(failures_patch.stop)
+
     def _write_csv(self, path: pathlib.Path, header, rows) -> None:
         with path.open("w", encoding="utf-8-sig", newline="") as file:
             writer = csv.writer(file)
@@ -29,6 +55,7 @@ class LoadComplexTest(unittest.TestCase):
             "kapt_code": "",
             "kapt_key": "",
             "match_source": "",
+            "reb_complex_id": "", "reb_match_source": "",
         }
         row.update(changes)
         return [row[column] for column in load_complex.CROSSWALK_COLUMNS]
@@ -53,12 +80,12 @@ class LoadComplexTest(unittest.TestCase):
     def test_reads_real_inputs_with_json_serializable_normalized_areas(self):
         crosswalk, areas = load_complex.load_inputs()
 
-        self.assertEqual(len(crosswalk), 7_362)
-        self.assertEqual(len(areas), 21_044)
-        self.assertEqual(areas[0]["payload"]["exclu_use_ar"], "175.8100")
+        self.assertEqual(len(crosswalk), 7_420)
+        self.assertEqual(len(areas), 27_744)
+        self.assertEqual(areas[0]["payload"]["exclu_use_ar"], "59.0400")
         self.assertIsNone(crosswalk[0]["kapt_code"])
-        self.assertIsNone(areas[0]["payload"]["kapt_area"])
-        self.assertIsNone(areas[0]["payload"]["households"])
+        self.assertEqual(areas[0]["payload"]["kapt_area"], "59.0400")
+        self.assertEqual(areas[0]["payload"]["households"], 12)
         json.dumps(areas[0], ensure_ascii=False)
 
     def test_separates_area_payload_from_validation_fields(self):
@@ -418,20 +445,22 @@ class LoadComplexTest(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertNotIn("last_seen_at", load_complex.DIGEST_COLUMNS["complex_area"])
         self.assertEqual(
-            fetch_mock.call_args.args,
+            fetch_mock.call_args.args[:5],
             (
                 "url", "key", "complex_area",
                 load_complex.DIGEST_COLUMNS["complex_area"],
                 "apt_seq,exclu_use_ar",
             ),
         )
+        self.assertEqual(fetch_mock.call_args.args[5], "apt_seq")
         with self.assertRaises(load_complex.InputError):
             load_complex._digest_value("exclu_use_ar", 84.98)
 
     def test_digest_separates_rows_and_normalizes_timestamp_to_utc(self):
         common = {
             "sgg_cd": "11110", "apt_nm": "단지", "road_key": None,
-            "kapt_code": None, "kapt_key": None, "match_source": None,
+            "kapt_code": None, "kapt_key": None, "match_source": None, "reb_complex_id": None,
+                "reb_fail_reason": None, "kapt_fail_reason": None,
         }
         rows = [
             {
@@ -445,8 +474,8 @@ class LoadComplexTest(unittest.TestCase):
                 "last_seen_at": "2026-09-26T00:00:00+00:00",
             },
         ]
-        first = "\x1f".join(("a", "11110", "단지", "", "", "", "", "2026-09-24T00:00:00.000000"))
-        second = "\x1f".join(("b", "11110", "단지", "", "", "", "", "2026-09-24T00:00:00.000000"))
+        first = "\x1f".join(("a", "11110", "단지", "", "", "", "", "", "", "", "2026-09-24T00:00:00.000000"))
+        second = "\x1f".join(("b", "11110", "단지", "", "", "", "", "", "", "", "2026-09-24T00:00:00.000000"))
         expected = hashlib.md5(f"{first}\x1e{second}".encode()).hexdigest()
         with patch.object(load_complex, "fetch_rows", return_value=rows):
             actual = load_complex.digest_table("url", "key", "complex")
@@ -458,7 +487,8 @@ class LoadComplexTest(unittest.TestCase):
             {
                 "sgg_cd": "11110", "apt_seq": "11110-1", "apt_nm": "단지",
                 "road_key": None, "kapt_code": None, "kapt_key": None,
-                "match_source": None,
+                "match_source": None, "reb_complex_id": None,
+                "reb_fail_reason": None, "kapt_fail_reason": None,
             }
         ]
         with (
@@ -481,7 +511,8 @@ class LoadComplexTest(unittest.TestCase):
             {
                 "sgg_cd": "11110", "apt_seq": apt_seq, "apt_nm": "단지",
                 "road_key": None, "kapt_code": None, "kapt_key": None,
-                "match_source": None,
+                "match_source": None, "reb_complex_id": None,
+                "reb_fail_reason": None, "kapt_fail_reason": None,
             }
             for apt_seq in ("11110-1", "11110-2")
         ]
@@ -512,7 +543,7 @@ class LoadComplexTest(unittest.TestCase):
             patch.object(
                 load_complex, "fetch_existing_apt_seqs", return_value={"11110-1"}
             ),
-            patch.object(load_complex, "count_rows", side_effect=[2, 2]),
+            patch.object(load_complex, "count_rows", side_effect=[2, 2, 1]),
             patch.object(
                 load_complex, "road_key_collisions",
                 side_effect=[set(), {"새 도로"}],
@@ -521,7 +552,7 @@ class LoadComplexTest(unittest.TestCase):
             patch.object(load_complex, "verify_last_seen_at") as last_seen_mock,
             patch.object(
                 load_complex, "digest_table",
-                side_effect=["a" * 32, "b" * 32],
+                side_effect=["a" * 32, "b" * 32, "c" * 32],
             ) as digest_mock,
             redirect_stdout(io.StringIO()) as output,
         ):
@@ -532,18 +563,19 @@ class LoadComplexTest(unittest.TestCase):
         self.assertIn("road_key 감사     C1 - C0 1\n  새 도로", output.getvalue())
         self.assertIn("멱등 다이제스트   complex 2행 ", output.getvalue())
         self.assertIn("멱등 다이제스트   complex_area 2행 ", output.getvalue())
+        self.assertNotIn("DB 에만 있는 키", output.getvalue())
         self.assertEqual(collision_mock.call_count, 2)
-        self.assertEqual(last_seen_mock.call_count, 2)
-        self.assertEqual(digest_mock.call_count, 2)
-        self.assertEqual([entry[0] for entry in sent_tables], ["complex", "complex_area"])
-        self.assertEqual(sent_tables[0][2], ("apt_seq",))
-        self.assertEqual(sent_tables[1][2], ("apt_seq", "exclu_use_ar"))
-        all_payloads = sent_tables[0][1] + sent_tables[1][1]
+        self.assertEqual(last_seen_mock.call_count, 3)
+        self.assertEqual(digest_mock.call_count, 3)
+        self.assertEqual([entry[0] for entry in sent_tables], ["reb_complex", "complex", "complex_area"])
+        self.assertEqual(sent_tables[0][2], ("reb_complex_id",))
+        self.assertEqual(sent_tables[2][2], ("apt_seq", "exclu_use_ar"))
+        all_payloads = sent_tables[0][1] + sent_tables[1][1] + sent_tables[2][1]
         self.assertEqual(len({row["last_seen_at"] for row in all_payloads}), 1)
         self.assertTrue(all("first_seen_at" not in row for row in all_payloads))
-        self.assertTrue(all("kapt_code" not in row for row in sent_tables[1][1]))
-        self.assertTrue(all("sgg_cd" not in row for row in sent_tables[1][1]))
-        self.assertTrue(all("apt_nm" not in row for row in sent_tables[1][1]))
+        self.assertTrue(all("kapt_code" not in row for row in sent_tables[2][1]))
+        self.assertTrue(all("sgg_cd" not in row for row in sent_tables[2][1]))
+        self.assertTrue(all("apt_nm" not in row for row in sent_tables[2][1]))
 
     def test_db_count_mismatch_stops_before_digest(self):
         counts = {
@@ -554,12 +586,12 @@ class LoadComplexTest(unittest.TestCase):
         with (
             patch.object(
                 load_complex, "load_inputs",
-                return_value=([{"apt_seq": "a"}, {"apt_seq": "b"}], []),
+                return_value=([{"apt_seq": "a", "reb_complex_id": None, "kapt_code": None}, {"apt_seq": "b", "reb_complex_id": None, "kapt_code": None}], []),
             ),
             patch.object(load_complex, "preflight_counts", return_value=(counts, 4)),
             patch.object(load_complex.collect, "_sb_config", return_value=("url", "key")),
             patch.object(load_complex, "fetch_existing_apt_seqs", return_value=set()),
-            patch.object(load_complex, "count_rows", side_effect=[1, 0]),
+            patch.object(load_complex, "count_rows", side_effect=[1, 0, 1]),
             patch.object(load_complex, "road_key_collisions", return_value=set()) as collision_mock,
             patch.object(load_complex, "upsert_rows") as upsert_mock,
             patch.object(load_complex, "digest_table") as digest_mock,
@@ -569,7 +601,7 @@ class LoadComplexTest(unittest.TestCase):
                 load_complex.main()
 
         self.assertIn("complex 적재된 행이 입력보다 적습니다", str(raised.exception))
-        self.assertEqual(upsert_mock.call_count, 2)
+        self.assertEqual(upsert_mock.call_count, 3)
         self.assertEqual(collision_mock.call_count, 1)
         digest_mock.assert_not_called()
 
@@ -585,7 +617,7 @@ class LoadComplexTest(unittest.TestCase):
             patch.object(
                 load_complex, "load_inputs",
                 return_value=(
-                    [{"apt_seq": "a"}],
+                    [{"apt_seq": "a", "reb_complex_id": None, "kapt_code": None}],
                     [{"payload": {"apt_seq": "a", "exclu_use_ar": "84.9800"}}],
                 ),
             ),
@@ -594,31 +626,37 @@ class LoadComplexTest(unittest.TestCase):
             patch.object(load_complex, "fetch_existing_apt_seqs", return_value={"a", "old"}),
             patch.object(load_complex, "road_key_collisions", side_effect=[set(), set()]),
             patch.object(load_complex, "upsert_rows"),
-            patch.object(load_complex, "count_rows", side_effect=[2, 2]),
+            patch.object(load_complex, "count_rows", side_effect=[2, 2, 2]),
             patch.object(
                 load_complex.collect, "_sb_request",
                 return_value=[{"last_seen_at": "2000-01-01T00:00:00Z"}],
             ),
             patch.object(
                 load_complex, "fetch_rows",
-                side_effect=lambda sb_url, sb_key, table, columns, order: (
+                side_effect=lambda sb_url, sb_key, table, columns, order, *args: (
                     [
                         {"apt_seq": "a", "last_seen_at": "9999-01-01T00:00:00Z"},
-                        {"apt_seq": "old", "last_seen_at": "2000-01-01T00:00:00Z"},
+                        {
+                            "apt_seq": "old", "first_seen_at": "1999-01-01T00:00:00Z",
+                            "last_seen_at": "2000-01-01T00:00:00Z",
+                            "reb_complex_id": None,
+                        },
                     ]
-                    if table == "complex" else [
+                    if table == "complex" else [{"reb_complex_id": "11110100000001", "last_seen_at": "9999-01-01T00:00:00Z"}]
+                    if table == "reb_complex" else [
                         {
                             "apt_seq": "a", "exclu_use_ar": Decimal("84.9800"),
                             "last_seen_at": "9999-01-01T00:00:00Z",
                         },
                         {
                             "apt_seq": "old", "exclu_use_ar": Decimal("50.0000"),
+                            "area_status": "K-apt 면적정보 없음",
                             "last_seen_at": "2000-01-01T00:00:00Z",
                         },
                     ]
                 ),
             ),
-            patch.object(load_complex, "digest_table", side_effect=["a" * 32, "b" * 32]),
+            patch.object(load_complex, "digest_table", side_effect=["a" * 32, "b" * 32, "c" * 32]),
             redirect_stdout(io.StringIO()) as output,
         ):
             load_complex.main()
@@ -626,6 +664,83 @@ class LoadComplexTest(unittest.TestCase):
         self.assertIn("DB 에만 있는 행   complex 1", output.getvalue())
         self.assertIn("DB 에만 있는 행   complex_area 1", output.getvalue())
         self.assertIn("적재 결과         complex 2 / complex_area 2", output.getvalue())
+        self.assertIn(
+            "DB 에만 있는 키   complex old first_seen_at=1999-01-01T00:00:00Z "
+            "last_seen_at=2000-01-01T00:00:00Z reb_complex_id=",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "DB 에만 있는 키   complex_area old / 50.0000 K-apt 면적정보 없음 "
+            "last_seen_at=2000-01-01T00:00:00Z",
+            output.getvalue(),
+        )
+        self.assertNotIn("DB 에만 있는 키   reb_complex", output.getvalue())
+
+    def test_db_only_keys_are_sorted_and_include_each_tables_details(self):
+        started_at = datetime(2026, 11, 6, tzinfo=timezone.utc)
+        old = "2000-01-01T00:00:00Z"
+        cases = {
+            "reb_complex": (
+                [{"reb_complex_id": "11110100000002", "last_seen_at": old},
+                 {"reb_complex_id": "11110100000001", "last_seen_at": old}],
+                ["11110100000001", "11110100000002"],
+            ),
+            "complex": (
+                [{"apt_seq": seq, "first_seen_at": old, "last_seen_at": old,
+                  "reb_complex_id": "11110100000001" if seq == "b" else None}
+                 for seq in ("b", "a")],
+                [f"a first_seen_at={old} last_seen_at={old} reb_complex_id=",
+                 f"b first_seen_at={old} last_seen_at={old} reb_complex_id=11110100000001"],
+            ),
+            "complex_area": (
+                [{"apt_seq": "a", "exclu_use_ar": area,
+                  "area_status": "K-apt 면적정보 없음", "last_seen_at": old}
+                 for area in (Decimal("100"), Decimal("39.04"))],
+                [f"a / 39.0400 K-apt 면적정보 없음 last_seen_at={old}",
+                 f"a / 100.0000 K-apt 면적정보 없음 last_seen_at={old}"],
+            ),
+        }
+        for table, (rows, expected) in cases.items():
+            with (
+                self.subTest(table=table),
+                patch.object(load_complex, "fetch_rows", return_value=rows) as fetch,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                load_complex.print_db_only_keys("url", "key", table, started_at)
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [f"DB 에만 있는 키   {table} {detail}" for detail in expected],
+            )
+            self.assertEqual(fetch.call_args.args[-1],
+                             "reb_complex_id" if table == "reb_complex" else "apt_seq")
+
+    def test_db_only_keys_exclude_current_and_future_rows_for_every_table(self):
+        started_at = datetime(2026, 11, 6, tzinfo=timezone.utc)
+        for table in ("reb_complex", "complex", "complex_area"):
+            with (
+                self.subTest(table=table),
+                patch.object(load_complex, "fetch_rows", return_value=[
+                    {"last_seen_at": "2026-11-06T09:00:00+09:00"},
+                    {"last_seen_at": "2026-11-07T00:00:00Z"},
+                ]),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                load_complex.print_db_only_keys("url", "key", table, started_at)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_db_only_keys_have_no_output_limit(self):
+        rows = [
+            {"reb_complex_id": f"{number:014d}", "last_seen_at": "2000-01-01T00:00:00Z"}
+            for number in range(501)
+        ]
+        with (
+            patch.object(load_complex, "fetch_rows", return_value=rows),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            load_complex.print_db_only_keys(
+                "url", "key", "reb_complex", datetime(2026, 11, 6, tzinfo=timezone.utc)
+            )
+        self.assertEqual(len(output.getvalue().splitlines()), 501)
 
     def test_truncated_existing_read_stops_before_any_upsert(self):
         zero_counts = dict.fromkeys(
@@ -636,7 +751,7 @@ class LoadComplexTest(unittest.TestCase):
             0,
         )
         with (
-            patch.object(load_complex, "load_inputs", return_value=([{"apt_seq": "a"}], [])),
+            patch.object(load_complex, "load_inputs", return_value=([{"apt_seq": "a", "reb_complex_id": None, "kapt_code": None}], [])),
             patch.object(load_complex, "preflight_counts", return_value=(zero_counts, 4)),
             patch.object(load_complex.collect, "_sb_config", return_value=("https://example.invalid", "key")),
             patch.object(load_complex, "count_rows", return_value=2),
@@ -666,11 +781,11 @@ class LoadComplexTest(unittest.TestCase):
         with (
             patch.object(
                 load_complex, "load_inputs",
-                return_value=([{"apt_seq": "a"}, {"apt_seq": "b"}], []),
+                return_value=([{"apt_seq": "a", "reb_complex_id": None, "kapt_code": None}, {"apt_seq": "b", "reb_complex_id": None, "kapt_code": None}], []),
             ),
             patch.object(load_complex, "preflight_counts", return_value=(zero_counts, 4)),
             patch.object(load_complex.collect, "_sb_config", return_value=("https://example.invalid", "key")),
-            patch.object(load_complex, "count_rows", side_effect=[2, 0, 2]),
+            patch.object(load_complex, "count_rows", side_effect=[2, 0, 1, 2]),
             patch.object(load_complex, "fetch_existing_apt_seqs", return_value=set()),
             patch.object(load_complex, "road_key_collisions", return_value=set()),
             patch.object(load_complex, "upsert_rows") as upsert_mock,
@@ -680,7 +795,8 @@ class LoadComplexTest(unittest.TestCase):
                 return_value=io.BytesIO(json.dumps([{
                     "apt_seq": "a", "sgg_cd": "11110", "apt_nm": "단지",
                     "road_key": None, "kapt_code": None, "kapt_key": None,
-                    "match_source": None,
+                    "match_source": None, "reb_complex_id": None,
+                "reb_fail_reason": None, "kapt_fail_reason": None,
                     "first_seen_at": "2026-09-24T00:00:00Z",
                 }]).encode()),
             ),
@@ -691,13 +807,14 @@ class LoadComplexTest(unittest.TestCase):
 
         self.assertIn("complex 조회가 잘렸습니다", str(raised.exception))
         self.assertNotIn("멱등 다이제스트", output.getvalue())
-        self.assertEqual(upsert_mock.call_count, 2)
+        self.assertEqual(upsert_mock.call_count, 3)
 
     def test_two_mocked_runs_keep_row_counts_and_digests(self):
         crosswalk = [{
             "sgg_cd": "11110", "apt_seq": "a", "apt_nm": "단지",
             "road_key": None, "kapt_code": None, "kapt_key": None,
-            "match_source": None,
+            "match_source": None, "reb_complex_id": None,
+                "reb_fail_reason": None, "kapt_fail_reason": None,
         }]
         areas = [{
             "payload": {
@@ -711,7 +828,7 @@ class LoadComplexTest(unittest.TestCase):
                 "max_decimal_places": 2,
             },
         }]
-        db = {"complex": {}, "complex_area": {}}
+        db = {"reb_complex": {}, "complex": {}, "complex_area": {}}
 
         def fake_request(method, path, sb_url, sb_key, body=None, prefer=None):
             table = path.split("?", 1)[0]
@@ -725,7 +842,7 @@ class LoadComplexTest(unittest.TestCase):
             for payload in body:
                 key = (
                     (payload["apt_seq"], payload["exclu_use_ar"])
-                    if table == "complex_area" else payload["apt_seq"]
+                    if table == "complex_area" else payload["reb_complex_id"] if table == "reb_complex" else payload["apt_seq"]
                 )
                 if key not in db[table]:
                     db[table][key] = {
@@ -734,7 +851,7 @@ class LoadComplexTest(unittest.TestCase):
                 else:
                     db[table][key].update(payload)
 
-        def fake_fetch(sb_url, sb_key, table, columns, order):
+        def fake_fetch(sb_url, sb_key, table, columns, order, *args):
             return [
                 {column: row[column] for column in columns}
                 for _, row in sorted(db[table].items())
@@ -748,7 +865,7 @@ class LoadComplexTest(unittest.TestCase):
             patch.object(load_complex, "fetch_rows", side_effect=fake_fetch),
             patch.object(
                 load_complex, "count_rows",
-                side_effect=lambda sb_url, sb_key, table: len(db[table]),
+                side_effect=lambda sb_url, sb_key, table, *args: len(db[table]),
             ),
         ):
             for _ in range(2):
@@ -766,6 +883,190 @@ class LoadComplexTest(unittest.TestCase):
         self.assertIn("신규 단지 수      0", outputs[1])
         self.assertIsNone(db["complex"]["a"]["kapt_code"])
         self.assertIsNone(db["complex_area"][("a", "84.9800")]["kapt_area"])
+
+
+class RegistryTest(unittest.TestCase):
+    def write_csv(self, path, header, rows, encoding="utf-8-sig"):
+        with path.open("w", encoding=encoding, newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    def registry_csv(self, rows):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "registry.csv"
+        self.write_csv(path, ("단지고유번호", "세대수", "사용승인일"), rows, "cp949")
+        return path
+
+    def test_registry_strips_id_and_preserves_valid_values(self):
+        for approval in ("2000-02-29", "2000-02-29 ", " 2000-02-29 "):
+            with self.subTest(approval=approval):
+                rows, counts = load_complex.load_reb_complex(self.registry_csv([
+                    ("11110100000001 ", "120", approval),
+                ]))
+                self.assertEqual(rows, [{"reb_complex_id": "11110100000001", "households": 120, "approval_date": "2000-02-29"}])
+                self.assertEqual(counts, {"households": 0, "approval_date": 0})
+
+    def test_invalid_households_and_dates_become_null_and_are_counted(self):
+        for household, approval in [
+            ("0", "2026-02-30"), ("-1", "20260101"),
+            ("1.5", "2026-W01-1"), ("", ""), ("abc", "2026-1-01"),
+            ("2147483648", "2026-01-01T00:00:00"),
+        ]:
+            with self.subTest(household=household, approval=approval):
+                rows, counts = load_complex.load_reb_complex(self.registry_csv([
+                    ("11110100000001", household, approval),
+                ]))
+                self.assertIsNone(rows[0]["households"])
+                self.assertIsNone(rows[0]["approval_date"])
+                self.assertEqual(counts, {"households": 1, "approval_date": 1})
+
+    def test_duplicate_registry_id_after_strip_is_rejected(self):
+        with self.assertRaisesRegex(load_complex.InputError, "중복"):
+            load_complex.load_reb_complex(self.registry_csv([
+                ("11110100000001 ", "1", "2000-01-01"),
+                ("11110100000001", "1", "2000-01-01"),
+            ]))
+
+    def test_invalid_registry_id_is_rejected(self):
+        for value in ("", "123", "1111010000000A", "１１１１０１０００００００１"):
+            with self.subTest(value=value), self.assertRaises(load_complex.InputError):
+                load_complex.load_reb_complex(self.registry_csv([(value, "1", "2000-01-01")]))
+
+    def test_missing_registry_headers_and_wrong_encoding_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "registry.csv"
+            self.write_csv(path, ("wrong",), [], "cp949")
+            with self.assertRaises(load_complex.InputError):
+                load_complex.load_reb_complex(path)
+            self.write_csv(path, ("단지고유번호", "세대수", "사용승인일"), [("11110100000001", "1", "2000-01-01")])
+            with self.assertRaises(load_complex.InputError):
+                load_complex.load_reb_complex(path)
+
+    def test_crosswalk_source_and_id_must_be_paired_and_known(self):
+        for reb_id, source in [("11110100000001", ""), ("", "원문 일치"), ("11110100000001", "추정"), ("123", "원문 일치")]:
+            with self.subTest(reb_id=reb_id, source=source), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "crosswalk.csv"
+                self.write_csv(path, load_complex.CROSSWALK_COLUMNS, [("11110", "a", "단지", "", "", "", "", reb_id, source)])
+                with self.assertRaises(load_complex.InputError):
+                    load_complex.load_crosswalk(path)
+
+    def test_failure_header_and_unknown_layer_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "failures.csv"
+            self.write_csv(path, load_complex.FAILURE_COLUMNS[:-1], [])
+            with self.assertRaises(load_complex.InputError):
+                load_complex.load_failures(path)
+            self.write_csv(path, load_complex.FAILURE_COLUMNS, [("11110", "a", "단지", "", "후보 없음", "다른 층")])
+            with self.assertRaises(load_complex.InputError):
+                load_complex.load_failures(path)
+
+    def inputs(self):
+        crosswalk = [
+            {"apt_seq": "a", "reb_complex_id": "11110100000001", "kapt_code": "A1"},
+            {"apt_seq": "b", "reb_complex_id": None, "kapt_code": None},
+        ]
+        registry = [{"reb_complex_id": "11110100000001"}]
+        failures = [
+            {"apt_seq": "b", "fail_layer": "단지 명부", "fail_reason": "후보 없음"},
+            {"apt_seq": "b", "fail_layer": "관리정보", "fail_reason": "K-apt 마스터에 없음"},
+        ]
+        return crosswalk, registry, failures
+
+    def test_preflight_assigns_reasons_and_clears_resolved_reasons(self):
+        crosswalk, registry, failures = self.inputs()
+        crosswalk[0].update(reb_fail_reason="후보 없음", kapt_fail_reason="K-apt 마스터에 없음")
+        failures.append({"apt_seq": "other", "fail_layer": "면적", "fail_reason": "무시"})
+        self.assertEqual(set(load_complex.registry_preflight(crosswalk, registry, failures).values()), {0})
+        self.assertIsNone(crosswalk[0]["reb_fail_reason"])
+        self.assertIsNone(crosswalk[0]["kapt_fail_reason"])
+        self.assertEqual(crosswalk[1]["reb_fail_reason"], "후보 없음")
+        self.assertEqual(crosswalk[1]["kapt_fail_reason"], "K-apt 마스터에 없음")
+
+    def test_preflight_counts_each_new_gate(self):
+        crosswalk, registry, failures = self.inputs()
+        crosswalk[0]["reb_complex_id"] = "11110100000002"
+        failures += [copy.copy(failures[0]), {"apt_seq": "a", "fail_layer": "관리정보", "fail_reason": "모름"}]
+        failures = [row for row in failures if row["fail_layer"] != "단지 명부"]
+        failures.append(copy.copy(failures[0]))
+        counts = load_complex.registry_preflight(crosswalk, registry, failures)
+        self.assertEqual(counts, {"명부번호없음": 1, "명부사유불일치": 1, "관리정보사유불일치": 1, "사유중복": 1, "모르는사유": 1})
+
+    def test_each_registry_gate_stops_before_configuration_or_writes(self):
+        for name in ("명부번호없음", "명부사유불일치", "관리정보사유불일치", "사유중복", "모르는사유"):
+            with (
+                self.subTest(name=name),
+                patch.object(load_complex, "registry_preflight", return_value={name: 1}),
+                patch.object(load_complex.collect, "_sb_config") as config,
+                patch.object(load_complex, "upsert_rows") as upsert,
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                load_complex.main()
+            config.assert_not_called()
+            upsert.assert_not_called()
+
+    def test_real_inputs_dry_run_has_no_database_access(self):
+        with patch.object(load_complex.collect, "_sb_config") as config, redirect_stdout(io.StringIO()) as output:
+            load_complex.main(dry_run=True)
+        config.assert_not_called()
+        self.assertIn("명부 공유(N:1)   번호 3 / 단지 6", output.getvalue())
+
+    def test_registry_count_shortfall_stops_before_digest(self):
+        with (
+            patch.object(load_complex.collect, "_sb_config", return_value=("url", "key")),
+            patch.object(load_complex, "fetch_existing_apt_seqs", return_value=set()),
+            patch.object(load_complex, "road_key_collisions", return_value=set()),
+            patch.object(load_complex, "upsert_rows") as upsert,
+            patch.object(load_complex, "count_rows", side_effect=[7420, 27744, 9527]),
+            patch.object(load_complex, "digest_table") as digest,
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(SystemExit, "reb_complex 적재된 행이 입력보다 적습니다"),
+        ):
+            load_complex.main()
+        self.assertEqual([call.args[0] for call in upsert.call_args_list], ["reb_complex", "complex", "complex_area"])
+        digest.assert_not_called()
+
+    def test_registry_database_error_stops_before_child_tables(self):
+        with (
+            patch.object(load_complex.collect, "_sb_config", return_value=("url", "key")),
+            patch.object(load_complex, "fetch_existing_apt_seqs", return_value=set()),
+            patch.object(load_complex, "road_key_collisions", return_value=set()),
+            patch.object(load_complex, "upsert_rows", side_effect=load_complex.InputError("DB 오류")) as upsert,
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(SystemExit, "DB 오류"),
+        ):
+            load_complex.main()
+        upsert.assert_called_once()
+        self.assertEqual(upsert.call_args.args[0], "reb_complex")
+
+    def test_registry_digest_includes_date_and_excludes_last_seen(self):
+        row = {"reb_complex_id": "11110100000001", "households": 120, "approval_date": "2000-01-01", "first_seen_at": "2026-01-01T00:00:00Z"}
+        with patch.object(load_complex, "fetch_rows", return_value=[row]) as fetch:
+            actual = load_complex.digest_table("url", "key", "reb_complex")
+        expected = hashlib.md5("\x1f".join(("11110100000001", "120", "2000-01-01", "2026-01-01T00:00:00.000000")).encode()).hexdigest()
+        self.assertEqual(actual, expected)
+        self.assertEqual(fetch.call_args.args[-1], "reb_complex_id")
+
+    def test_registry_fetch_and_count_use_registry_primary_key(self):
+        with patch.object(load_complex, "count_rows", return_value=1) as count, patch.object(load_complex, "urlopen", return_value=io.BytesIO(b'[{"reb_complex_id":"11110100000001"}]')):
+            rows = load_complex.fetch_rows("https://example.invalid", "key", "reb_complex", ("reb_complex_id",), "reb_complex_id", "reb_complex_id")
+        count.assert_called_once_with("https://example.invalid", "key", "reb_complex", "reb_complex_id")
+        self.assertEqual(len(rows), 1)
+
+    def test_registry_last_seen_surplus_checks_current_registry_ids(self):
+        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for current_stamp, valid in [("2026-01-02T00:00:00Z", True), ("2000-01-01T00:00:00Z", False)]:
+            with self.subTest(valid=valid), patch.object(load_complex.collect, "_sb_request", return_value=[{"last_seen_at": "2000-01-01T00:00:00Z"}]), patch.object(load_complex, "fetch_rows", return_value=[
+                {"reb_complex_id": "11110100000001", "last_seen_at": current_stamp},
+                {"reb_complex_id": "old", "last_seen_at": "2000-01-01T00:00:00Z"},
+            ]):
+                if valid:
+                    load_complex.verify_last_seen_at("url", "key", "reb_complex", started, {"11110100000001"})
+                else:
+                    with self.assertRaises(load_complex.InputError):
+                        load_complex.verify_last_seen_at("url", "key", "reb_complex", started, {"11110100000001"})
 
 
 if __name__ == "__main__":
