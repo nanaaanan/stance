@@ -1,11 +1,13 @@
 # 실거래 원장 스키마
 
-국토교통부 아파트 실거래 API 응답과 단지 마스터를 담는 6개 테이블, 수집 건수 변화 이력 뷰 1개.
+국토교통부 아파트 실거래 API 응답과 단지 마스터를 담는 7개 테이블, 수집 건수 변화 이력과 단지 명부 읽기를 위한 뷰 3개.
 
 |                     |                                                         |
 | ------------------- | ------------------------------------------------------- |
 | DDL                 | `supabase/migrations/20260818104853_deal_tables.sql`    |
 | 단지 마스터 DDL     | `supabase/migrations/20260922115132_complex_master_tables.sql` |
+| 단지 명부 확장 DDL | `supabase/migrations/20261104223723_complex_registry_columns.sql` |
+| 단지 명부 읽기 뷰 DDL | `supabase/migrations/20261105224617_complex_registry_views.sql` |
 | 수집 건수 이력 뷰 DDL | `supabase/migrations/20260906092758_collect_count_history_view.sql` |
 | 설계 근거가 된 실측 | `data/recon-summary.md`                                 |
 | API 호출 예시       | `docs/api/molit-trade.http`, `docs/api/molit-rent.http` |
@@ -39,7 +41,7 @@
 
 <br/>
 
-## 테이블 6개와 관계
+## 테이블 7개와 관계
 
 ```
                   수집 배치 (Python)
@@ -70,6 +72,7 @@
 | `trade`           | 매매 거래 1건의 **현재 상태**   | 같은 거래는 그 행을 고침   |
 | `rent`            | 전월세 계약 1건의 **현재 상태** | 같은 계약은 그 행을 고침   |
 | `complex`         | 단지 1개                         | 같은 단지는 그 행을 고침   |
+| `reb_complex`     | 단지 명부의 단지 1개              | 같은 명부 번호는 그 행을 고침 |
 | `complex_area`    | 단지의 실거래 면적 1개           | 같은 단지와 면적은 그 행을 고침 |
 | `deal_change_log` | 값이 바뀐 순간 1회              | 안 바뀌면 아무것도 안 쌓임 |
 | `collect_run`     | 수집 시도 1회                   | 덮어쓰지 않고 계속 쌓임    |
@@ -90,7 +93,7 @@
 
 같은 단지의 매매와 전월세를 연결할 때는 `apt_seq` 를 쓴다. 양쪽 응답 모두 이 값을 주고, 강남구 실측에서 빠진 행이 0건이었다.
 
-단지 관리정보는 `complex` 와 `complex_area` 에 둔다. K-apt 쪽에는 `aptSeq` 가 없어서 도로명 조인 키로 연결한 결과를 저장한다. 단지명이나 지번은 조인 키로 쓰지 않는다.
+K-apt 관리정보의 연결은 `complex` 에, 단지 명부 속성은 `reb_complex` 에, 공시가격 면적 명부와 거래 면적의 대응은 `complex_area` 에 둔다. K-apt 쪽에는 `aptSeq` 가 없어서 도로명 조인 키로 연결한 결과를 저장한다. 단지명이나 지번은 조인 키로 쓰지 않는다.
 
 <br/>
 
@@ -239,31 +242,83 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 | `kapt_code` | `text` | K-apt 단지 코드. 없으면 NULL. 유일하지 않음 |
 | `kapt_key` | `text` | 매칭 사전에 실제로 있던 키. 없으면 NULL |
 | `match_source` | `text` | 어느 경로로 매칭됐는지. 없으면 NULL |
+| `reb_complex_id` | `text` | `reb_complex(reb_complex_id)` 참조. N:1 허용, 삭제 제한. 미매칭이면 NULL |
+| `reb_fail_reason` | `text` | 단지 명부 층 매칭 실패 사유. 매칭되면 NULL |
+| `kapt_fail_reason` | `text` | K-apt 관리정보 층 매칭 실패 사유. 매칭되면 NULL |
 | `first_seen_at` `last_seen_at` | `timestamptz` | 처음 본 시각 / 마지막으로 본 시각 |
 
 `kapt_code`, `kapt_key`, `match_source` 는 셋이 모두 채워지거나 모두 NULL 이어야 한다. `road_key` 를 포함한 nullable 문자열에는 빈 문자열을 저장하지 않는다.
 
-PK 외의 조회용 인덱스는 아직 만들지 않았다. 화면 쿼리가 확정된 뒤 실제 조회 조건에 맞춰 추가한다.
+`reb_complex_id` 에 참조 조회와 명부 공유 집계를 위한 인덱스가 있다. DB는 각 층의 번호와 실패 사유가 동시에 채워지는 것을 막는다. 기존 행의 확장 적용을 위해 둘 다 NULL은 허용하며, 적재기가 이번 입력 키에서 층별로 번호와 사유 중 정확히 하나가 있는지 사전 검사한다. 실패 사유는 `data/matching-failures.csv`에서 읽고 해소되면 NULL로 덮어쓴다. 사유 값 목록은 DB 제약이 아니라 적재기가 검사한다.
+
+### reb_complex
+
+`data/reb-complex-seoul-apt.csv` 단지 명부의 전체 행을 저장한다. 명부 번호는 앞뒤 공백을 제거한 14자리 숫자 문자열이다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `reb_complex_id` | `text` | PK. 단지 명부 번호 |
+| `households` | `integer` | 명부 한 단지의 총 세대수. 이 번호를 가리키는 단지가 여럿일 수 있다. 양의 정수가 아니면 NULL |
+| `approval_date` | `date` | 명부 사용승인일. 엄격한 `YYYY-MM-DD` 날짜가 아니면 NULL |
+| `first_seen_at` `last_seen_at` | `timestamptz` | 처음 본 시각 / 마지막으로 본 시각 |
+
+여러 `apt_seq`가 하나의 명부 번호를 공유할 수 있으므로 총 세대수를 `complex`에 복사하지 않는다. 명부를 읽을 때 세대수와 사용승인일의 NULL 변환 수를 출력한다. RLS를 켜고 anon/authenticated에는 SELECT만, service_role에는 SELECT/INSERT/UPDATE만 부여한다.
 
 ### complex_area
 
-단지의 실거래 전용면적과 K-apt 면적 그룹의 대응이다. 한 행은 `(apt_seq, exclu_use_ar)` 하나를 뜻한다.
+단지의 매매와 전월세에 나온 실거래 전용면적과 공시가격 면적 명부 그룹의 대응이다. 한 행은 `(apt_seq, exclu_use_ar)` 하나를 뜻한다. `data/complex-area.csv`의 `kapt_code`, `kapt_area`, `households`는 기존 칸 이름을 유지하지만 공시가격 면적 명부 기준이다. CSV의 `kapt_code`는 DB 면적 행에 저장하지 않는다.
 
 | 컬럼 | 타입 | 비고 |
 | --- | --- | --- |
 | `apt_seq` | `text` | PK 첫 칸. `complex(apt_seq)` 를 참조하며 삭제는 제한 |
 | `exclu_use_ar` | `numeric(9,4)` | PK 둘째 칸. 실거래 전용면적 |
-| `area_status` | `text` | `면적 매칭`, `면적 ±0.5㎡ 밖`, `면적 동점(모호)`, `K-apt 면적정보 없음` 중 하나 |
-| `kapt_area` | `numeric(9,4)` | 할당된 K-apt 면적. 매칭되지 않았으면 NULL |
-| `households` | `integer` | 해당 K-apt 면적의 세대수. 없으면 NULL |
-| `group_id` | `text` | 그룹 안의 최소 면적 문자열. `±0.5㎡ 밖` 또는 `동점(모호)`이면 NULL |
+| `area_status` | `text` | `면적 매칭`, `면적 ±0.5㎡ 밖`, `면적 동점(모호)`, `면적 명부 없음` 또는 이전 상태 `K-apt 면적정보 없음` |
+| `kapt_area` | `numeric(9,4)` | 할당된 공시가격 면적 명부 면적. 매칭되지 않았으면 NULL |
+| `households` | `integer` | 공시가격 면적 명부의 해당 면적 세대수. 없으면 NULL. 명부 단지 전체 세대수와 다름 |
+| `group_id` | `text` | 그룹 안의 최소 면적 문자열. `±0.5㎡ 밖`, `동점(모호)`, `면적 명부 없음`이면 NULL |
 | `group_label` | `integer` | 화면 표시용 정수 라벨. 계산에는 사용하지 않음 |
 | `group_areas` | `text` | 그룹 구성 면적을 오름차순 `\|` 로 연결한 문자열 |
 | `first_seen_at` `last_seen_at` | `timestamptz` | 처음 본 시각 / 마지막으로 본 시각 |
 
 면적과 세대수는 함께 채워지고, 그룹 칸 3개도 함께 채워지거나 함께 NULL 이어야 한다. 면적, 세대수, 그룹 라벨은 값이 있으면 0보다 커야 한다.
 
+`complex_area.households`는 공시가격 명부 면적 하나의 세대수다. 같은 `group_id`에 묶인 여러 실거래 면적 행이 같은 값을 반복할 수 있다. 예를 들어 `11350-37`의 84.2㎡와 84.38㎡ 두 행의 세대수는 각각 50이다. 단지 합계를 낼 때 이 행들의 세대수를 그대로 더하지 않는다.
+
 PK의 선두 칸이 `apt_seq` 이므로 별도 `apt_seq` 인덱스는 만들지 않았다.
+
+### 세대수를 읽는 뷰
+
+앱(`src/lib/data/`)은 세대수를 아래 두 뷰에서만 읽는다. 바탕 테이블의 `households`를 거래 단지에 붙여 읽지 않는다. 뷰의 PK로 바탕 테이블과 1:1 조인해 다른 단지/면적 속성을 읽는다.
+
+두 뷰의 `reb_shared_count`는 잔존 행을 포함한 DB의 `complex` 전체에서 같은 `reb_complex_id`를 가진 행 수다. 명부 번호가 NULL이면 공유 수도 NULL이다. 공유 수가 1일 때만 세대수를 내며, 다른 단지와 명부 번호를 공유하거나 번호가 없으면 세대수는 NULL이다. 바탕 테이블의 원천 세대수는 보존한다.
+
+`complex_registry_view`는 `complex` 한 행당 한 행이다.
+
+| 칸 | 타입 | 값 |
+| --- | --- | --- |
+| `apt_seq` | `text` | 거래 단지 PK |
+| `reb_complex_id` | `text` | 단지 명부 번호. 없으면 NULL |
+| `reb_shared_count` | `bigint` | 같은 명부 번호를 가진 단지 수. 번호가 없으면 NULL |
+| `households` | `integer` | 공유 수가 1일 때만 `reb_complex.households`. 그 밖에는 NULL |
+| `approval_date` | `date` | 명부 사용승인일. 공유 여부와 무관하게 유지. 번호가 없으면 NULL |
+
+`complex_area_registry_view`는 `complex_area` 한 행당 한 행이다.
+
+| 칸 | 타입 | 값 |
+| --- | --- | --- |
+| `apt_seq` | `text` | 면적 PK 첫 칸 |
+| `exclu_use_ar` | `numeric(9,4)` | 면적 PK 둘째 칸 |
+| `group_id` | `text` | 바탕 면적 행의 표시 그룹 식별자 |
+| `reb_shared_count` | `bigint` | 해당 거래 단지의 명부 공유 수. 번호가 없으면 NULL |
+| `households` | `integer` | 공유 수가 1일 때만 `complex_area.households`. 그 밖에는 NULL |
+
+두 뷰 모두 `security_invoker = true`로 호출자 기준의 바탕 테이블 권한과 RLS를 따른다. anon/authenticated/service_role에는 SELECT만 부여한다.
+
+### 현재 대응표 밖의 잔존 행
+
+적재가 성공한 뒤 `complex`, `complex_area`에서 `last_seen_at`이 마지막 적재 시각보다 이른 행은 현재 대응표 밖의 잔존 행이다. 번호와 실패 사유가 모두 NULL인 잔존 행은 매칭 성공이 아니라 이번 적재에서 판정되지 않았음을 뜻한다. 화면에서는 정보 미확인으로 읽는다. 잔존 행의 면적 값은 옛 출처인 K-apt 기준일 수 있다.
+
+적재기는 이번 입력 키에 대해서만 층별 번호/사유 불변식을 검사한다. 잔존 행은 삭제하거나 사유를 채우지 않고, `DB 에만 있는 행` 수와 정렬된 `DB 에만 있는 키`를 별도로 출력한다. 단지 키 줄에는 `reb_complex_id=<값 또는 빈칸>`도 포함해 명부 번호를 가진 잔존 단지를 식별한다. 잔존 행은 적재 실패가 아니다. 적재 도중 실패한 실행의 시각은 이 판정의 기준으로 사용하지 않는다.
 
 ### collect_run
 
@@ -562,10 +617,13 @@ trg_rent_keep_filled
 | ------------------------------- | ------------------------------- | ---------------------------- |
 | `trade` `rent`                  | 읽기만                          | 읽기, 넣기, 고치기           |
 | `complex` `complex_area`        | 읽기만                          | 읽기, 넣기, 고치기           |
+| `reb_complex`                  | 읽기만                          | 읽기, 넣기, 고치기           |
+| `complex_registry_view` (뷰)    | 읽기만                          | 읽기만                      |
+| `complex_area_registry_view` (뷰) | 읽기만                        | 읽기만                      |
 | `deal_change_log` `collect_run` | 접근 불가                       | 읽기, 넣기, 고치기           |
 | `collect_count_history` (뷰)    | 접근 불가                       | 읽기만                      |
 
-- RLS 는 6개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area` 에만 전체 읽기 정책을 둔다
+- RLS 는 7개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area`/`reb_complex` 에만 전체 읽기 정책을 둔다
 - `anon` 을 넣는 이유: 익명 세션 발급이 끝나기 전에 데이터를 요청하는 구간이 있고, 그때 역할은 `authenticated` 가 아니라 `anon` 이다
 - 수집 스크립트에 **DELETE 를 주지 않는다.** 이 설계는 upsert 와 표시만 쓰므로 지울 일이 없다. 권한이 없으면 실수도 없다
 - Supabase 는 새 테이블에 권한을 자동으로 주므로 `revoke` 를 먼저 하고 `grant` 한다. `grant` 는 더하기만 하기 때문이다
@@ -752,12 +810,13 @@ DB 에 표시를 남기는 비용은 컬럼 하나뿐이고, 대신 나중에 "�
 
 `trade` / `rent` 에는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year`, `umd_nm` 등)이 **거래 행마다 반복해서** 들어 있다. 같은 사실이 거래 행과 `complex` 두 곳에 존재한다.
 
-`trade` / `rent` 에 남는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year` 등)은 **그 시점 응답의 원본 스냅샷**이고, **화면이 읽는 것은 항상 `complex` 다.**
+`trade` / `rent` 에 남는 단지 속성(`apt_nm`, `road_nm`, `jibun`, `build_year` 등)은 **그 시점 응답의 원본 스냅샷**이고, **화면이 읽는 단지명과 주소 같은 기본 단지 속성은 항상 `complex`에서 가져온다.** 세대수와 명부 사용승인일은 `complex_registry_view` / `complex_area_registry_view`로 읽는다. 사용승인일은 `complex_registry_view`에 있다.
 
 | 어디                 | 무엇인가                       | 화면이 읽나 |
 | -------------------- | ------------------------------ | ----------- |
 | `trade` / `rent` 의 단지 속성 | 그 시점 응답의 **원본 스냅샷** | 아니오      |
-| `complex`                     | 화면이 읽는 **유일한 곳**      | 예          |
+| `complex`                     | 기본 단지 속성을 읽는 **유일한 곳** | 예       |
+| `complex_registry_view` / `complex_area_registry_view` | 세대수와 명부 사용승인일을 읽는 곳 | 예 |
 
 중복이지만 `trade` / `rent` 쪽을 지우지 않는다. 매일 다시 수집하면 **마스터에 없는 `apt_seq` 가 들어오는데**, 그때 그 단지 정보의 유일한 출처가 거래 행이기 때문이다.
 

@@ -10,7 +10,7 @@ export type Database = {
   // Allows to automatically instantiate createClient with right options
   // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
-    PostgrestVersion: "14.5"
+    PostgrestVersion: "14.15"
   }
   public: {
     Tables: {
@@ -95,9 +95,12 @@ export type Database = {
           apt_seq: string
           first_seen_at: string
           kapt_code: string | null
+          kapt_fail_reason: string | null
           kapt_key: string | null
           last_seen_at: string
           match_source: string | null
+          reb_complex_id: string | null
+          reb_fail_reason: string | null
           road_key: string | null
           sgg_cd: string
         }
@@ -106,9 +109,12 @@ export type Database = {
           apt_seq: string
           first_seen_at?: string
           kapt_code?: string | null
+          kapt_fail_reason?: string | null
           kapt_key?: string | null
           last_seen_at?: string
           match_source?: string | null
+          reb_complex_id?: string | null
+          reb_fail_reason?: string | null
           road_key?: string | null
           sgg_cd: string
         }
@@ -117,13 +123,24 @@ export type Database = {
           apt_seq?: string
           first_seen_at?: string
           kapt_code?: string | null
+          kapt_fail_reason?: string | null
           kapt_key?: string | null
           last_seen_at?: string
           match_source?: string | null
+          reb_complex_id?: string | null
+          reb_fail_reason?: string | null
           road_key?: string | null
           sgg_cd?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "complex_reb_complex_id_fkey"
+            columns: ["reb_complex_id"]
+            isOneToOne: false
+            referencedRelation: "reb_complex"
+            referencedColumns: ["reb_complex_id"]
+          },
+        ]
       }
       complex_area: {
         Row: {
@@ -233,6 +250,30 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      reb_complex: {
+        Row: {
+          approval_date: string | null
+          first_seen_at: string
+          households: number | null
+          last_seen_at: string
+          reb_complex_id: string
+        }
+        Insert: {
+          approval_date?: string | null
+          first_seen_at?: string
+          households?: number | null
+          last_seen_at?: string
+          reb_complex_id: string
+        }
+        Update: {
+          approval_date?: string | null
+          first_seen_at?: string
+          households?: number | null
+          last_seen_at?: string
+          reb_complex_id?: string
+        }
+        Relationships: []
       }
       rent: {
         Row: {
