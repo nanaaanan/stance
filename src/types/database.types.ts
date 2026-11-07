@@ -187,6 +187,13 @@ export type Database = {
             referencedRelation: "complex"
             referencedColumns: ["apt_seq"]
           },
+          {
+            foreignKeyName: "complex_area_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
         ]
       }
       deal_change_log: {
@@ -467,6 +474,49 @@ export type Database = {
           valid_until: string | null
         }
         Relationships: []
+      }
+      complex_area_registry_view: {
+        Row: {
+          apt_seq: string | null
+          exclu_use_ar: number | null
+          group_id: string | null
+          households: number | null
+          reb_shared_count: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "complex_area_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+          {
+            foreignKeyName: "complex_area_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
+      complex_registry_view: {
+        Row: {
+          approval_date: string | null
+          apt_seq: string | null
+          households: number | null
+          reb_complex_id: string | null
+          reb_shared_count: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "complex_reb_complex_id_fkey"
+            columns: ["reb_complex_id"]
+            isOneToOne: false
+            referencedRelation: "reb_complex"
+            referencedColumns: ["reb_complex_id"]
+          },
+        ]
       }
     }
     Functions: {
