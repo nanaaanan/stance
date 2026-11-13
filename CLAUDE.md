@@ -73,8 +73,6 @@ data/                     matching-failures.csv 등 산출물
 한 머지에 확장과 축소를 함께 담지 않는다. 담는 순간 그 배포는 되돌릴 수 없는 배포가 된다
 ```
 
-- 마이그레이션이 든 PR 은 템플릿의 세 번째 검증 칸에 확장인지 축소인지, 한 머지에 둘이 섞이지 않았는지 적는다
-
 ## 데이터 핵심 사실
 
 - 매매는 **상세 API** `getRTMSDataSvcAptTradeDev` (기본 API에는 `aptSeq`가 없다)
