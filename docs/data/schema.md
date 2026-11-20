@@ -1,6 +1,6 @@
 # 실거래 원장 스키마
 
-국토교통부 아파트 실거래 API 응답과 단지 마스터를 담는 7개 테이블, 수집 건수 변화 이력과 단지 명부 읽기를 위한 뷰 3개.
+국토교통부 아파트 실거래 API 응답, 단지 마스터와 매매 파생값을 담는 9개 테이블, 수집 건수 변화 이력과 단지 명부 읽기를 위한 뷰 3개.
 
 |                     |                                                         |
 | ------------------- | ------------------------------------------------------- |
@@ -8,6 +8,7 @@
 | 단지 마스터 DDL     | `supabase/migrations/20260922115132_complex_master_tables.sql` |
 | 단지 명부 확장 DDL | `supabase/migrations/20261104223723_complex_registry_columns.sql` |
 | 단지 명부 읽기 뷰 DDL | `supabase/migrations/20261105224617_complex_registry_views.sql` |
+| 매매 파생값 DDL | `supabase/migrations/20261117000000_trade_stats.sql` |
 | 수집 건수 이력 뷰 DDL | `supabase/migrations/20260906092758_collect_count_history_view.sql` |
 | 설계 근거가 된 실측 | `data/recon-summary.md`                                 |
 | API 호출 예시       | `docs/api/molit-trade.http`, `docs/api/molit-rent.http` |
@@ -41,7 +42,7 @@
 
 <br/>
 
-## 테이블 7개와 관계
+## 테이블 9개와 관계
 
 ```
                   수집 배치 (Python)
@@ -76,6 +77,8 @@
 | `complex_area`    | 단지의 실거래 면적 1개           | 같은 단지와 면적은 그 행을 고침 |
 | `deal_change_log` | 값이 바뀐 순간 1회              | 안 바뀌면 아무것도 안 쌓임 |
 | `collect_run`     | 수집 시도 1회                   | 덮어쓰지 않고 계속 쌓임    |
+| `trade_group_stats` | 단지의 표시 그룹 1개 | 갱신 함수가 전체 교체 |
+| `trade_complex_stats` | 단지의 매매 건수와 회전율 재료 | 갱신 함수가 전체 교체 |
 
 `collect_count_history` 는 `collect_run` 에서 첫 관측과 건수 변화 시점을 읽는 뷰다. 별도로 저장하지 않는다.
 
@@ -206,6 +209,74 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 | `trade_apt_date_idx` | `(apt_seq, deal_date desc)` | 단지 상세 화면                              |
 
 검색 화면 쿼리가 정해지기 전에는 인덱스를 늘리지 않는다. 인덱스는 조회를 빠르게 하는 대신 쓰기를 느리게 하므로, 쓸지 안 쓸지 모르는 인덱스는 비용만 낸다.
+
+### trade_group_stats
+
+시세 판정용 매매 파생값이다. 현재 행(`is_current = true`)이 하나 이상 있는 `(apt_seq, group_id)`를 저장한다. 창 안 유효 거래가 없어도 행을 남긴다. 그룹 없는 거래는 이 표에서 빠진다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `apt_seq` | `text` | PK 일부. `complex(apt_seq)` 참조 |
+| `group_id` | `text` | PK 일부. 표시 그룹 식별자 |
+| `group_label` | `integer` | 표시용 라벨. 그룹 안 라벨 충돌이면 갱신 전체 실패 |
+| `valid_count` | `integer` | 창 안 유효 `sum(trade_count)`. 0 이상 |
+| `min_price` `max_price` | `integer` | 창 안 유효 최저가, 최고가. 만원 |
+| `ratio_base_price` | `numeric` | 전세가율 분모 전용. `sum(deal_amount::numeric * trade_count) / nullif(sum(trade_count), 0)`. 창 안 유효만, 반올림 없음 |
+| `excluded_ambiguous` | `integer` | 창 안 '해제 불분명'의 `sum(trade_count)` |
+| `excluded_cancel` | `integer` | 창 안 '해제'의 `sum(trade_count)` |
+| `excluded_direct` | `integer` | 창 안 '직거래'의 `sum(trade_count)` |
+| `last_valid_ym` | `text` | 전 기간 유효 거래의 마지막 계약월. 없으면 NULL |
+| `window_start_ym` `window_end_ym` | `text` | 숫자 6자리 계약월. 현재 KST(한국 표준시) 달을 포함한 12개월 |
+| `refreshed_at` | `timestamptz` | 파생값 계산 시각 |
+
+유효 건수 0일 때에만 세 가격이 모두 NULL이다. 최저가는 최고가 이하여야 하고, 제외 건수는 각각 0 이상이다. 검색용 인덱스는 `trade_group_stats_min_price_idx (min_price)`다. 면적 칸은 두지 않는다.
+
+#### 유효 거래 판정 규칙
+
+`public.trade_stat_reason(p_is_current boolean, p_ambiguous_cancel boolean, p_cdeal_type text, p_dealing_gbn text)`가 다음 순서에서 처음 맞는 문자열 하나를 반환한다. SQL 불변 함수로 판정을 한 곳에 둔다.
+
+| 순서 | 반환 문자열 | 실제 거래 칸의 조건 |
+| --- | --- | --- |
+| 1 | `정정됨` | `is_current = false` |
+| 2 | `해제 불분명` | `ambiguous_cancel = true` |
+| 3 | `해제` | `cdeal_type is not null` |
+| 4 | `직거래` | `dealing_gbn = '직거래'`. NULL은 해당 없음 |
+| 5 | `유효` | 위 조건에 해당 없음 |
+
+거래 건수는 `count(*)`가 아닌 `sum(trade_count)`다. `scripts/coverage.py`와 같은 유효 집합이 되는 것은 수집기 불변식(`ambiguous_cancel = true`이면 `cdeal_type = 'O'`) 아래에서만 성립한다. `(true, true, NULL, '중개거래')`는 여기서는 '해제 불분명', coverage에서는 유효이므로 불변식 위반 행 수를 따로 확인한다.
+
+### trade_complex_stats
+
+`complex`의 모든 단지를 저장한다. 회전율 나눗셈과 반올림은 앱 레이어가 맡는다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `apt_seq` | `text` | PK. `complex(apt_seq)` 참조 |
+| `valid_count` | `integer` | 그룹 유무와 무관한 창 안 단지 전체 유효 `sum(trade_count)`. 0 이상 |
+| `ungrouped_valid_count` | `integer` | 위 건수 중 그룹 없는 거래. 면적 행 없는 거래도 포함. 0 이상, 전체 유효 건수 이하 |
+| `households` | `integer` | `complex_registry_view.households` |
+| `approval_date` | `date` | `complex_registry_view.approval_date` |
+| `turnover_exclusion` | `text` | `명부 공유`, `세대수 없음`, `사용승인일 없음`, `준공 2년 미만` 또는 NULL |
+| `window_start_ym` `window_end_ym` | `text` | 그룹 표와 같은 숫자 6자리 계약월 |
+| `refreshed_at` | `timestamptz` | 그룹 표와 같은 파생값 계산 시각 |
+
+회전율 제외 사유는 명부 공유(`reb_shared_count > 1`), 세대수 없음, 사용승인일 없음, 준공 2년 미만 순서에서 처음 해당하는 값이다. 준공 2년 미만은 `approval_date + interval '2 years' > 창 끝 다음 달 1일`이다. 제외 사유가 NULL이면 세대수와 사용승인일이 모두 있어야 한다.
+
+#### 갱신과 읽는 쪽 계약
+
+갱신 명령은 `python3 scripts/refresh_stats.py`다. 환경변수 `SUPABASE_URL`(없으면 `NEXT_PUBLIC_SUPABASE_URL`)과 `SUPABASE_SERVICE_ROLE_KEY`로 DB 함수 원격 호출(RPC) `public.refresh_trade_stats()`를 한 번 호출하며 재시도하지 않는다. 수집 단계가 종료 코드 0일 때만 호출한다.
+
+갱신 함수는 두 결과 표를 EXCLUSIVE 모드로 잠가 동시 갱신을 직렬화하고, DELETE 후 두 INSERT와 요약을 SQL 문장 하나에서 계산한다. 읽기는 계속 가능하며, 실패하면 이전 값이 남는다. `complex`에 없는 단지의 거래는 저장하지 않고 반환값 `trades_without_complex`에 `sum(trade_count)`로 집계한다. 반환값은 `window_start_ym`, `window_end_ym`, `refreshed_at`, `group_rows`, `complex_rows`, `valid_count`, `ungrouped_valid_count`, `trades_without_complex`다.
+
+`refreshed_at`은 파생값 계산 시각이다. 원장을 확인한 시각과 수집 성공 여부는 `collect_run`에서 읽는다. 읽는 쪽은 다음 세 상태를 구분한다.
+
+| 상태 | 조건 |
+| --- | --- |
+| 현재 값 | `window_end_ym`이 현재 KST 달과 같음 |
+| 오래된 값 | `window_end_ym`이 현재 KST 달과 다름 |
+| 미계산 | 표가 비어 있음 |
+
+최근 3개월 밖 해제가 원장에 자동 반영되지 않는 제한은 아래 "알려진 한계"의 "오래된 구간의 정정, 해제"와 같다.
 
 ### rent
 
@@ -600,12 +671,13 @@ trg_rent_keep_filled
 | --------------------------------------- | -------------------------------- | ------------------ |
 | 자연키 중복 병합 (해제 쌍 합치기)       | `scripts/collect.py`             | 적재 직전          |
 | 빈 값이 채워진 값을 덮지 않게           | DB 트리거 `keep_filled_values`   | UPDATE 직전        |
-| 직거래 제외, 해제 제외 후 최저가/최고가 | `src/lib/domain/clean.ts` (예정) | 화면에서 판정할 때 |
+| 유효 거래 판정과 매매 파생값 저장 | DB 함수 `trade_stat_reason` + `refresh_trade_stats` | 갱신할 때 |
+| DB 판정과 같은 규칙 대조 | `src/lib/domain/clean.ts` (S2 예정) | 고정 입력으로 대조하는 순수 함수 |
 
 기준은 **"원본을 바꾸는가"** 다.
 
 - 병합은 저장 형태를 정하는 일이라 적재 때 한 번만 돈다
-- 직거래와 해제 제외는 원본을 지우지 않고 **볼 때 걸러내는** 일이라 판정 시점에 돈다. 그래서 DB 에는 직거래도 해제도 그대로 남아 있다
+- 직거래와 해제 제외는 원본을 지우지 않고 갱신 함수에서 판정한다. 원장에는 직거래도 해제도 그대로 남아 있다
 
 <br/>
 
@@ -622,8 +694,16 @@ trg_rent_keep_filled
 | `complex_area_registry_view` (뷰) | 읽기만                        | 읽기만                      |
 | `deal_change_log` `collect_run` | 접근 불가                       | 읽기, 넣기, 고치기           |
 | `collect_count_history` (뷰)    | 접근 불가                       | 읽기만                      |
+| `trade_group_stats` `trade_complex_stats` | 읽기만 | 읽기만. 쓰기는 갱신 함수 내부에서만 |
 
-- RLS 는 7개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area`/`reb_complex` 에만 전체 읽기 정책을 둔다
+| 함수 | anon / authenticated | service_role |
+| --- | --- | --- |
+| `trade_stat_reason(boolean, boolean, text, text)` | 실행 불가 | 실행 가능 |
+| `refresh_trade_stats()` | 실행 불가 | 실행 가능 |
+
+두 함수는 PUBLIC, anon, authenticated의 실행 권한을 회수한 뒤 service_role에만 실행 권한을 준다. 갱신 함수는 소유자 권한(`security definer`)으로 실행하며 `search_path = ''`로 고정하고 본문의 테이블과 함수에 `public.`을 붙인다.
+
+- RLS 는 9개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area`/`reb_complex`/`trade_group_stats`/`trade_complex_stats`에 전체 읽기 정책을 둔다
 - `anon` 을 넣는 이유: 익명 세션 발급이 끝나기 전에 데이터를 요청하는 구간이 있고, 그때 역할은 `authenticated` 가 아니라 `anon` 이다
 - 수집 스크립트에 **DELETE 를 주지 않는다.** 이 설계는 upsert 와 표시만 쓰므로 지울 일이 없다. 권한이 없으면 실수도 없다
 - Supabase 는 새 테이블에 권한을 자동으로 주므로 `revoke` 를 먼저 하고 `grant` 한다. `grant` 는 더하기만 하기 때문이다
@@ -800,7 +880,7 @@ PostgREST 는 upsert 를 하고 나서 넣은 건지 고친 건지 알려주지 
 
 자연키가 같은 정상 거래가 2건 이상인데 해제 통지가 있으면, **어느 거래가 해제됐는지 알 수 없다.** 원본에 1:1 로 대응하는 거래 ID 가 없어서 생기는 정보 부족이라 알고리즘으로 풀리지 않는다.
 
-이 경우 `ambiguous_cancel = true` 로 표시하고, 통계에서는 **해제 우선**으로 판정한다.
+이 경우 `ambiguous_cancel = true` 로 표시하고, 통계에서는 **해제 불분명** 사유로 제외한다. 정정됨 다음, 해제보다 먼저 판정한다.
 
 **이 판정이 "안전한 쪽"인 것은 아니다.** 정상 2건 중 1건만 해제됐는데 2건 모두 해제로 취급하면 유효 표본을 실제보다 적게 잡는 것이다. 그런데도 이쪽을 고른 이유는 **없는 정보를 만들지 않는다**는 원칙 때문이다. "해제됐을 수도 있는 거래를 시세에 넣지 않는다"이지 "틀려도 안전하다"가 아니다.
 
