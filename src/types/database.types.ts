@@ -459,6 +459,123 @@ export type Database = {
         }
         Relationships: []
       }
+      trade_complex_stats: {
+        Row: {
+          approval_date: string | null
+          apt_seq: string
+          households: number | null
+          refreshed_at: string
+          turnover_exclusion: string | null
+          ungrouped_valid_count: number
+          valid_count: number
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Insert: {
+          approval_date?: string | null
+          apt_seq: string
+          households?: number | null
+          refreshed_at: string
+          turnover_exclusion?: string | null
+          ungrouped_valid_count: number
+          valid_count: number
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Update: {
+          approval_date?: string | null
+          apt_seq?: string
+          households?: number | null
+          refreshed_at?: string
+          turnover_exclusion?: string | null
+          ungrouped_valid_count?: number
+          valid_count?: number
+          window_end_ym?: string
+          window_start_ym?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "trade_complex_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: true
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+          {
+            foreignKeyName: "trade_complex_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: true
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
+      trade_group_stats: {
+        Row: {
+          apt_seq: string
+          excluded_ambiguous: number
+          excluded_cancel: number
+          excluded_direct: number
+          group_id: string
+          group_label: number
+          last_valid_ym: string | null
+          max_price: number | null
+          min_price: number | null
+          ratio_base_price: number | null
+          refreshed_at: string
+          valid_count: number
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Insert: {
+          apt_seq: string
+          excluded_ambiguous: number
+          excluded_cancel: number
+          excluded_direct: number
+          group_id: string
+          group_label: number
+          last_valid_ym?: string | null
+          max_price?: number | null
+          min_price?: number | null
+          ratio_base_price?: number | null
+          refreshed_at: string
+          valid_count: number
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Update: {
+          apt_seq?: string
+          excluded_ambiguous?: number
+          excluded_cancel?: number
+          excluded_direct?: number
+          group_id?: string
+          group_label?: number
+          last_valid_ym?: string | null
+          max_price?: number | null
+          min_price?: number | null
+          ratio_base_price?: number | null
+          refreshed_at?: string
+          valid_count?: number
+          window_end_ym?: string
+          window_start_ym?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "trade_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+          {
+            foreignKeyName: "trade_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
     }
     Views: {
       collect_count_history: {
@@ -520,7 +637,16 @@ export type Database = {
       }
     }
     Functions: {
-      [_ in never]: never
+      refresh_trade_stats: { Args: never; Returns: Json }
+      trade_stat_reason: {
+        Args: {
+          p_ambiguous_cancel: boolean
+          p_cdeal_type: string
+          p_dealing_gbn: string
+          p_is_current: boolean
+        }
+        Returns: string
+      }
     }
     Enums: {
       [_ in never]: never

@@ -71,3 +71,10 @@
 - **원인**: `discover`와 모듈 지정은 테스트가 없어도 성공한다. 파이프 뒤의 `$?`는 마지막 명령의 종료코드다.
 - **해결**: 테스트 클래스와 메서드까지 적은 dotted name을 명령에 넣고, 잘못된 입력에서 실패하는지 확인했다.
 - **재발 방지**: 음성 테스트를 공식 dotted-name 명령에 포함해 통과해서는 안 되는 입력이 통과하면 자동 실패시킨다. 파이프를 쓰는 공식 검증 명령은 `set -o pipefail`을 켜 파이프 전체의 종료코드를 검사한다.
+
+## API 로 부른 DB 함수가 `DELETE requires a WHERE clause` 로 실패함
+
+- **증상**: `rpc/refresh_trade_stats` 호출이 400, 코드 21000. 같은 함수 본문을 SQL Editor 나 psql 에서 돌리면 문제없다
+- **원인**: Supabase 는 API 요청이 쓰는 `authenticator` 역할에 `pg-safeupdate` 를 미리 올려 둔다(`session_preload_libraries`). 이 확장은 WHERE 없는 DELETE, UPDATE 를 막는다. `security definer` 함수 안의 문장도 같은 세션이라 막힌다
+- **해결**: 전체 삭제를 `delete from ... where true` 로 바꾼 새 마이그레이션. `TRUNCATE` 는 갱신 중 읽기까지 막아서 쓰지 않았다
+- **재발 방지**: API 로 부를 함수에 전체 DELETE, UPDATE 를 쓸 때는 처음부터 `where true` 를 붙인다. psql 검증만으로는 못 잡으니 함수는 반드시 API 경로로 한 번 불러 본다
