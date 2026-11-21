@@ -318,5 +318,43 @@ class RebCrosswalkTest(unittest.TestCase):
                                  expected_failures)
 
 
+class ReadPageRetryTest(unittest.TestCase):
+    def test_server_error_is_retried_and_client_error_is_not(self):
+        import io
+        from unittest.mock import MagicMock, patch
+        from urllib.error import HTTPError
+
+        def http_error(status, body):
+            return HTTPError("https://fixture", status, "fixture", {}, io.BytesIO(body))
+
+        ok = MagicMock()
+        ok.__enter__.return_value.read.return_value = b"[]"
+        with (
+            patch.object(crosswalk, "urlopen", side_effect=[
+                http_error(500, b'{"code":"57014"}'), ok]) as fetch,
+            patch.object(crosswalk.time, "sleep") as sleep,
+        ):
+            self.assertEqual(crosswalk._read_page("request", 1), "[]")
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(crosswalk.RETRY_WAITS_SEC[0])
+
+        with (
+            patch.object(crosswalk, "urlopen", side_effect=http_error(500, b'{"code":"57014"}')) as fetch,
+            patch.object(crosswalk.time, "sleep"),
+            self.assertRaisesRegex(RuntimeError, r"^Supabase HTTP 500"),
+        ):
+            crosswalk._read_page("request", 1)
+        self.assertEqual(fetch.call_count, 1 + len(crosswalk.RETRY_WAITS_SEC))
+
+        with (
+            patch.object(crosswalk, "urlopen", side_effect=http_error(403, b"{}")) as fetch,
+            patch.object(crosswalk.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, r"^Supabase HTTP 403$"),
+        ):
+            crosswalk._read_page("request", 1)
+        self.assertEqual(fetch.call_count, 1)
+        sleep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

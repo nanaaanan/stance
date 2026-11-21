@@ -550,9 +550,49 @@ class RentAreaTest(unittest.TestCase):
         with patch.object(area, "urlopen", return_value=response), self.assertRaisesRegex(
                 ValueError, "rent 1 id=1.*84.98001"):
             area.fetch_rent_rows("1", "https://fixture", "key")
-        with patch.object(area, "urlopen", side_effect=URLError("fixture DNS failure")), self.assertRaisesRegex(
-                RuntimeError, "Supabase 조회 실패.*fixture DNS failure"):
+        with (
+            patch.object(area, "urlopen", side_effect=URLError("fixture DNS failure")) as fetch,
+            patch.object(area.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "Supabase 조회 실패.*fixture DNS failure"),
+        ):
             area.fetch_rent_rows("1", "https://fixture", "key")
+        self.assertEqual(fetch.call_count, 1 + len(area.RETRY_WAITS_SEC))
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], list(area.RETRY_WAITS_SEC))
+
+    def test_read_page_retries_server_error_then_succeeds_and_never_retries_client_error(self):
+        import io
+        from urllib.error import HTTPError
+
+        def http_error(status, body):
+            return HTTPError("https://fixture", status, "fixture", {}, io.BytesIO(body))
+
+        ok = unittest.mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b"[]"
+        with (
+            patch.object(area, "urlopen", side_effect=[
+                http_error(500, b'{"code":"57014"}'), ok]) as fetch,
+            patch.object(area.time, "sleep") as sleep,
+        ):
+            self.assertEqual(area._read_page("request", 1), "[]")
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(area.RETRY_WAITS_SEC[0])
+
+        with (
+            patch.object(area, "urlopen", side_effect=http_error(500, b"not json")) as fetch,
+            patch.object(area.time, "sleep"),
+            self.assertRaisesRegex(RuntimeError, r"^Supabase HTTP 500$"),
+        ):
+            area._read_page("request", 1)
+        self.assertEqual(fetch.call_count, 1 + len(area.RETRY_WAITS_SEC))
+
+        with (
+            patch.object(area, "urlopen", side_effect=http_error(401, b'{"code":"PGRST301"}')) as fetch,
+            patch.object(area.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, r"^Supabase HTTP 401 PGRST301$"),
+        ):
+            area._read_page("request", 1)
+        self.assertEqual(fetch.call_count, 1)
+        sleep.assert_not_called()
 
     def test_main_g2a_uses_trade_only_and_rent_failure_keeps_files(self):
         rents = [{"apt_seq": "X", "exclu_use_ar": "60"},

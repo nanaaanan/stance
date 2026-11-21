@@ -14,6 +14,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import time
 from decimal import Decimal
 from datetime import date
 from urllib.error import HTTPError, URLError
@@ -32,6 +33,7 @@ SELECT = ",".join([
 ])
 PAGE_SIZE = 1000
 TIMEOUT_SEC = 60
+RETRY_WAITS_SEC = (2, 5)  # 읽기 요청 재시도 전 대기 초. 길이가 곧 재시도 횟수
 
 CROSSWALK_COLUMNS = [
     "sgg_cd", "apt_seq", "apt_nm", "road_key",
@@ -66,6 +68,36 @@ def load_districts():
         )
 
 
+def _read_page(request, timeout):
+    """GET 한 번의 응답 본문. 서버 오류와 연결 오류만 정해진 횟수 재시도."""
+    # 재시도가 안전한 이유
+    #   - 읽기 전용 GET. 같은 요청을 다시 보내도 DB 가 바뀌지 않음
+    # 4xx 는 재시도하지 않음
+    #   - 키나 쿼리가 틀린 것. 다시 보내도 같은 결과
+    for wait in (*RETRY_WAITS_SEC, None):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as exc:
+            if exc.code < 500 or wait is None:
+                raise RuntimeError(f"Supabase HTTP {exc.code} {_error_code(exc)}".rstrip()) from None
+            reason = f"HTTP {exc.code} {_error_code(exc)}".rstrip()
+        except (URLError, TimeoutError, OSError) as exc:
+            if wait is None:
+                raise RuntimeError(f"Supabase 조회 실패: {exc}") from None
+            reason = "연결 오류"
+        print(f"조회 재시도: {reason}, {wait}초 뒤", file=sys.stderr)
+        time.sleep(wait)
+
+
+def _error_code(exc) -> str:
+    """오류 응답 본문의 PostgREST 코드. 본문이 JSON 이 아니면 빈 문자열."""
+    try:
+        return str(json.loads(exc.read()).get("code") or "")
+    except (ValueError, AttributeError, OSError):
+        return ""
+
+
 def fetch_district(sgg_cd, url, api_key):
     """한 구의 전 기간 current 거래를 id 순으로 전부 조회."""
     # id는 유일한 정렬 키다. apt_seq 같은 비유일 키면 offset 페이지 경계가 흔들린다.
@@ -80,13 +112,7 @@ def fetch_district(sgg_cd, url, api_key):
             f"{url}/rest/v1/{path}",
             headers={"apikey": api_key, "Authorization": f"Bearer {api_key}"},
         )
-        try:
-            with urlopen(request, timeout=TIMEOUT_SEC) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            raise RuntimeError(f"Supabase HTTP {exc.code}") from None
-        except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Supabase 조회 실패: {exc}") from None
+        body = _read_page(request, TIMEOUT_SEC)
         # PostgREST numeric 값을 float로 파싱하면 정밀도가 바뀌어 후속 키가 갈라질 수 있다.
         chunk = json.loads(body, parse_float=Decimal)
         rows.extend(chunk)
