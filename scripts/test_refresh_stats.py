@@ -7,7 +7,7 @@ import refresh_stats
 
 
 class RefreshStatsTest(unittest.TestCase):
-    def test_success_prints_all_eight_keys_and_posts_once(self):
+    def test_success_prints_all_eight_keys_then_elapsed_and_posts_once(self):
         result = {
             "window_start_ym": "202512",
             "window_end_ym": "202611",
@@ -21,6 +21,7 @@ class RefreshStatsTest(unittest.TestCase):
         with (
             patch.object(refresh_stats, "_sb_config", return_value=("url", "key")),
             patch.object(refresh_stats, "_sb_request", return_value=result) as request,
+            patch.object(refresh_stats.time, "monotonic", side_effect=[10.0, 16.84]),
             redirect_stdout(io.StringIO()) as output,
             redirect_stderr(io.StringIO()) as errors,
         ):
@@ -29,7 +30,8 @@ class RefreshStatsTest(unittest.TestCase):
             "POST", "rpc/refresh_trade_stats", "url", "key", body={}
         )
         self.assertEqual(output.getvalue().splitlines(), [
-            f"{key} {value}" for key, value in result.items()
+            *(f"{key} {value}" for key, value in result.items()),
+            "elapsed_sec 6.8",
         ])
         self.assertEqual(errors.getvalue(), "")
 
@@ -40,6 +42,7 @@ class RefreshStatsTest(unittest.TestCase):
                 patch.object(refresh_stats, "_sb_config", return_value=("url", "key")),
                 patch.object(refresh_stats, "_sb_request", side_effect=
                     refresh_stats.SupabaseError(status, "오" * 300 + "잘림")) as request,
+                patch.object(refresh_stats.time, "monotonic", side_effect=[10.0, 18.25]),
                 redirect_stdout(io.StringIO()) as output,
                 redirect_stderr(io.StringIO()) as errors,
             ):
@@ -48,7 +51,9 @@ class RefreshStatsTest(unittest.TestCase):
                     "POST", "rpc/refresh_trade_stats", "url", "key", body={}
                 )
                 self.assertEqual(output.getvalue(), "")
-                self.assertEqual(errors.getvalue(), f"status={status} {'오' * 300}\n")
+                self.assertEqual(
+                    errors.getvalue(), f"status={status} {'오' * 300}\nelapsed_sec 8.2\n"
+                )
 
     def test_missing_configuration_keeps_existing_exit_and_does_not_request(self):
         with (
