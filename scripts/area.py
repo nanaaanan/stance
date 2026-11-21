@@ -16,6 +16,7 @@ import pathlib
 import random
 import subprocess
 import sys
+import time
 from decimal import (
     Decimal, DefaultContext, InvalidOperation, ROUND_HALF_EVEN, ROUND_HALF_UP, localcontext,
 )
@@ -68,6 +69,7 @@ FAILURE_REASONS = {
 }
 
 MATCH_LIMIT = Decimal("0.5")
+RETRY_WAITS_SEC = (2, 5)  # 읽기 요청 재시도 전 대기 초. 길이가 곧 재시도 횟수
 BOUNDARIES = (Decimal("60"), Decimal("85"), Decimal("102"))
 
 
@@ -236,6 +238,36 @@ def fetch_rent_rows(sgg_cd: str, url: str, key: str) -> list[dict]:
     return _fetch_area_rows("rent", sgg_cd, url, key)
 
 
+def _read_page(request, timeout):
+    """GET 한 번의 응답 본문. 서버 오류와 연결 오류만 정해진 횟수 재시도."""
+    # 재시도가 안전한 이유
+    #   - 읽기 전용 GET. 같은 요청을 다시 보내도 DB 가 바뀌지 않음
+    # 4xx 는 재시도하지 않음
+    #   - 키나 쿼리가 틀린 것. 다시 보내도 같은 결과
+    for wait in (*RETRY_WAITS_SEC, None):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as exc:
+            if exc.code < 500 or wait is None:
+                raise RuntimeError(f"Supabase HTTP {exc.code} {_error_code(exc)}".rstrip()) from None
+            reason = f"HTTP {exc.code} {_error_code(exc)}".rstrip()
+        except (URLError, TimeoutError, OSError) as exc:
+            if wait is None:
+                raise RuntimeError(f"Supabase 조회 실패: {exc}") from None
+            reason = "연결 오류"
+        print(f"조회 재시도: {reason}, {wait}초 뒤", file=sys.stderr)
+        time.sleep(wait)
+
+
+def _error_code(exc) -> str:
+    """오류 응답 본문의 PostgREST 코드. 본문이 JSON 이 아니면 빈 문자열."""
+    try:
+        return str(json.loads(exc.read()).get("code") or "")
+    except (ValueError, AttributeError, OSError):
+        return ""
+
+
 def _fetch_area_rows(table: str, sgg_cd: str, url: str, key: str) -> list[dict]:
     """한 구의 전 기간 current 거래에서 면적 조합에 필요한 열만 전부 조회."""
     output = []
@@ -250,13 +282,7 @@ def _fetch_area_rows(table: str, sgg_cd: str, url: str, key: str) -> list[dict]:
             f"{url}/rest/v1/{path}&offset={offset}&limit={coverage.PAGE_SIZE}",
             headers={"apikey": key, "Authorization": f"Bearer {key}"},
         )
-        try:
-            with urlopen(request, timeout=coverage.TIMEOUT_SEC) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            raise RuntimeError(f"Supabase HTTP {exc.code}") from None
-        except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Supabase 조회 실패: {exc}") from None
+        body = _read_page(request, coverage.TIMEOUT_SEC)
         chunk = json.loads(body, parse_float=Decimal)
         for row in chunk:
             if previous_id is not None and row["id"] <= previous_id:
