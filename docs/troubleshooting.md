@@ -78,3 +78,24 @@
 - **원인**: Supabase 는 API 요청이 쓰는 `authenticator` 역할에 `pg-safeupdate` 를 미리 올려 둔다(`session_preload_libraries`). 이 확장은 WHERE 없는 DELETE, UPDATE 를 막는다. `security definer` 함수 안의 문장도 같은 세션이라 막힌다
 - **해결**: 전체 삭제를 `delete from ... where true` 로 바꾼 새 마이그레이션. `TRUNCATE` 는 갱신 중 읽기까지 막아서 쓰지 않았다
 - **재발 방지**: API 로 부를 함수에 전체 DELETE, UPDATE 를 쓸 때는 처음부터 `where true` 를 붙인다. psql 검증만으로는 못 잡으니 함수는 반드시 API 경로로 한 번 불러 본다
+
+## 갱신 job 의 면적 스텝이 `승인되지 않은 면적 동점 조합` 으로 실패함
+
+- **증상**: `collect` 워크플로의 `refresh` job 이 면적 스텝에서 멈추고 로그에 `G4 새 면적 동점 조합` 과 단지 목록이 나온다. 매일 같은 자리에서 실패한다
+- **원인**: 새 거래로 명부 면적 후보 둘이 똑같이 가까운 조합이 생겼다. 코드가 고르면 추측이 되므로 일부러 멈춘다
+- **해결**: 로컬에서 `scripts/crosswalk.py`, `scripts/area.py` 를 순서대로 돌리고 `git diff data/complex-area.csv` 로 새 동점 줄을 확인한 뒤 `data/` CSV 3개를 커밋한다. 커밋이 곧 승인이다. 그다음 실패한 run 을 재실행하지 말고 새로 실행한다(재실행은 승인 전 커밋을 다시 받는다)
+- **재발 방지**: 게이트를 끄지 않는다. 실패한 동안 DB 는 마지막으로 성공한 실행의 값 그대로이고, 파생값 표의 계산 시각으로 며칠째인지 안다
+
+## 갱신 job 이 `Supabase HTTP 500` 으로 실패함
+
+- **증상**: `refresh` job 의 대응표나 면적 스텝이 `Supabase HTTP 500` 으로 끝난다. 같은 명령을 다시 돌리면 통과한다
+- **원인**: 두 스크립트는 매매와 전월세를 1,000행씩 나눠 읽는데, 그중 한 요청이 일시 오류를 받으면 재시도 없이 멈춘다
+- **해결**: 가장 최근 run 의 "Re-run failed jobs". 수집은 다시 돌지 않고 `refresh` 만 다시 돈다
+- **재발 방지**: 두 스텝은 DB 를 읽기만 하므로 실패해도 DB 는 그대로다. 옛 run 은 재실행하지 않는다(그 뒤 수집이 실패했다면 그 상태로 계산한다)
+
+## 매매 파생값 갱신이 `canceling statement due to statement timeout` 으로 실패함
+
+- **증상**: `rpc/refresh_trade_stats` 가 500, 코드 57014. 다시 부르면 성공하기도 한다
+- **원인**: API 로 들어온 요청은 `authenticator` 역할의 문장 제한 8초를 받는다. `service_role` 에는 따로 정한 값이 없어 이 8초가 적용된다
+- **해결**: `alter function ... set statement_timeout = '25s'` 로 이 함수에만 예외를 줬다. 역할 단위로 늘리면 다른 요청까지 풀린다
+- **재발 방지**: 갱신 스크립트가 걸린 시간을 `elapsed_sec` 으로 출력한다(성공하면 워크플로 요약, 실패하면 스텝 로그). 이 값이 계속 늘면 제한을 더 늘리지 말고 쿼리를 고친다

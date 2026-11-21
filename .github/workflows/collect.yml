@@ -76,6 +76,52 @@ jobs:
           python3 scripts/collect.py --failures-since "$COLLECT_STARTED_AT" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "::error title=$ALERT_TITLE::$ALERT_MESSAGE"
 
+  # 수집이 쌓은 거래로 단지 마스터와 매매 파생값을 다시 계산
+  # needs 만 쓰고 if 를 쓰지 않는 이유
+  #   - 수집이 실패한 날은 이 job 도 건너뛰어야 함. 일부 구만 들어온 거래로 계산하지 않음
+  #   - if: always() 를 붙이면 그 건너뛰기가 풀림
+  # collect 에 스텝으로 붙이지 않은 이유
+  #   - 이 job 은 공공데이터 키 없이 돎
+  #   - 실패했을 때 수집을 다시 부르지 않고 이 job 만 재실행 가능
+  refresh:
+    needs: collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # 대응표와 면적이 만든 CSV 는 이 job 안에서만 쓰고 커밋하지 않음
+      #   - 그래서 DB 가 저장소의 data/*.csv 보다 최신
+      #   - 로컬에서 적재할 때는 대응표와 면적을 먼저 다시 만들 것. 저장소 CSV 를 그대로 적재하면 DB 가 옛 값으로 돌아감
+      - name: 대응표
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/crosswalk.py
+      # 새 면적 동점이 생기면 여기서 실패하는 것이 의도
+      #   - 승인 기준은 커밋된 data/complex-area.csv
+      #   - 처리 절차는 docs/troubleshooting.md
+      - name: 면적
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/area.py
+      - name: 단지 마스터 적재
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/load_complex.py
+      # shell: bash 는 pipefail 을 켬
+      #   - 없으면 갱신이 실패해도 tee 때문에 성공으로 보임
+      - name: 매매 파생값 갱신
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python3 scripts/refresh_stats.py | tee -a "$GITHUB_STEP_SUMMARY"
+
   # 60일 무커밋 시 스케줄 워크플로가 자동 비활성화되는 것 방어
   # collect 와 분리한 이유
   #   - 실행 보장만이면 if: always() 로 충분
