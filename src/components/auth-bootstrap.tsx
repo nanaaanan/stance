@@ -10,8 +10,9 @@
 //   linkIdentity('google') 로 승격시킨다. 이때 user id 가 그대로 유지되므로
 //   지금까지 쌓인 데이터가 그대로 따라온다.
 //
-// 우선 UUID 를 화면에 그대로 출력.(배포 환경까지 연결됐다는 증거 확인용)
-//   앱 셸 작업 시 화면 출력은 제거하고 훅으로 옮길 예정
+// 루트 레이아웃에 합치지 말 것
+//   - 레이아웃에 'use client' 를 붙이면 머리말, 바닥글까지 브라우저 번들에 포함
+//   - 브라우저 전용 동작만 이 컴포넌트로 분리해 레이아웃에 1회 장착
 // ============================================================
 
 'use client'
@@ -19,16 +20,10 @@
 //   next.js app router 는 기본이 서버 컴포넌트라서, useEffect/useState 같은
 //   브라우저 기능을 쓰려면 반드시 이 한 줄이 필요.
 
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { supabase } from '@/lib/supabase/client'
 
 export function AuthBootstrap() {
-  // uid: 화면에 표시할 사용자 UUID. 아직 모를 때는 null
-  const [uid, setUid] = useState<string | null>(null)
-  // err: 실패했을 때 이유를 화면에 띄우기 위한 상태
-  //      콘솔만 찍으면 배포 환경에서 원인 못 찾음.
-  const [err, setErr] = useState<string | null>(null)
-
   useEffect(() => {
     // useEffect 는 "화면이 그려진 뒤에 실행할 일"을 적는 곳
     // 두 번째 인자 [] 는 "처음 한 번만 실행" 이라는 뜻
@@ -42,27 +37,20 @@ export function AuthBootstrap() {
       } = await supabase.auth.getSession()
 
       if (session) {
-        setUid(session.user.id)
         return // 있으면 새로 만들지 않는다. 만들면 기존 데이터와 연결이 끊김
       }
 
       // 2) 없으면 익명 세션 발급
-      const { data, error } = await supabase.auth.signInAnonymously()
+      const { error } = await supabase.auth.signInAnonymously()
 
       if (error) {
-        setErr(error.message)
-        return
+        // 오류 원문(error.message)은 화면에 내보내지 않음
+        //   - 내부 용어가 사용자에게 그대로 노출됨
+        //   - 수집 창구는 콘솔 하나. 오류 추적 도구 도입 시 이 줄을 교체
+        console.error('익명 세션 발급 실패:', error.message)
       }
-
-      setUid(data.user?.id ?? null)
     })()
   }, [])
 
-  if (err) {
-    return <p className="text-xs text-red-500">세션 오류: {err}</p>
-  }
-
-  return (
-    <p className="text-xs text-neutral-400">session: {uid ?? '연결 중...'}</p>
-  )
+  return null
 }
