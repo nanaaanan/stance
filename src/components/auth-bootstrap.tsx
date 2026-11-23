@@ -23,21 +23,42 @@
 import { useEffect } from 'react'
 import { supabase } from '@/lib/supabase/client'
 
+// 화면 로드 1회당 발급 시도 1회
+//   - 개발 모드의 StrictMode 는 effect 를 두 번 실행
+//   - 두 실행이 모두 "세션 없음" 을 읽으면 익명 계정이 2개 생성됨
+let started = false
+
 export function AuthBootstrap() {
   useEffect(() => {
     // useEffect 는 "화면이 그려진 뒤에 실행할 일"을 적는 곳
     // 두 번째 인자 [] 는 "처음 한 번만 실행" 이라는 뜻
+    if (started) {
+      return
+    }
+    started = true
 
     // async 함수를 즉시 실행하는 형태.
     // useEffect 자체는 async 를 붙일 수 없어서 안쪽에 따로 만든다.
     ;(async () => {
       // 1) 이미 세션이 있는가? (재방문자 / 새로고침)
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
+      let result = await supabase.auth.getSession()
 
-      if (session) {
+      // 발급 조건은 "오류 없이 세션 없음" 하나. 오류를 "세션 없음" 으로 처리하지 말 것
+      //   - 통신 오류로 갱신 실패: SDK 는 쿠키를 유지한 채 session: null 과 error 를 반환
+      //   - 갱신 도중 다른 탭이 토큰 교체: 저장소에 유효한 세션이 있어도 session: null 과 error 를 반환
+      //   - 위 두 경우에 새로 발급하면 기존 방문자의 세션을 덮어씀
+      //   - 갱신 토큰이 거절된 경우는 SDK 가 세션을 삭제. 재조회하면 오류 없이 세션 없음
+      if (!result.data.session && result.error) {
+        result = await supabase.auth.getSession()
+      }
+
+      if (result.data.session) {
         return // 있으면 새로 만들지 않는다. 만들면 기존 데이터와 연결이 끊김
+      }
+
+      if (result.error) {
+        console.error('세션 확인 실패:', result.error.message)
+        return
       }
 
       // 2) 없으면 익명 세션 발급
