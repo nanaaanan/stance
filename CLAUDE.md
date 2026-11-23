@@ -33,7 +33,7 @@ src/components/           UI 컴포넌트
 src/lib/domain/           순수 함수 (부수효과 없음) = 단위 테스트 대상
 src/lib/data/             Supabase 접근. 쿼리는 전부 여기로
 src/lib/supabase/         client.ts(브라우저) / server.ts(서버)
-config/                   regulation.json / market.json / assumptions.json / districts.json
+config/                   regulation.json / market.json / assumptions.json / districts.json / journey.json
 scripts/                  수집·정제 배치 (Python)
 supabase/migrations/      스키마 DDL. SQL Editor 실행분을 파일로 남긴다
 docs/api/                 REST Client(.http)

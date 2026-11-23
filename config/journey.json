@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "집을 살 때 거치는 단계. steps 배열의 순서가 여정의 순서",
+    "byStance 가 false 인 단계의 기한은 그 단계의 사건이 일어난 날부터 세는 법정 기한",
+    "등기 신청 기한 60일은 기산점인 balance(잔금) 단계에 있음. registration(등기) 단계에는 자체 기한 없음",
+    "orderRules 는 법이 정한 단계 사이의 순서. 화면이 정한 순서가 아님",
+    "법정 근거가 없는 단계는 넣지 않음",
+    "기한, 기산점, 조문을 고칠 때는 법령 본문과 대조. 2차 출처 사용 금지",
+    "effectiveDate 는 대조한 법령 판의 시행일. null 은 대조 기록이 없는 값"
+  ],
+  "_source": "국가법령정보센터(law.go.kr) 법령 본문",
+  "steps": [
+    {
+      "key": "viewpoint",
+      "name": "관점",
+      "byStance": true,
+      "duty": null,
+      "deadlineDays": null,
+      "deadlineFrom": null,
+      "legalBasis": null,
+      "effectiveDate": null,
+      "officialUrl": null,
+      "profession": null
+    },
+    {
+      "key": "budget",
+      "name": "예산",
+      "byStance": true,
+      "duty": null,
+      "deadlineDays": null,
+      "deadlineFrom": null,
+      "legalBasis": null,
+      "effectiveDate": null,
+      "officialUrl": null,
+      "profession": null
+    },
+    {
+      "key": "search",
+      "name": "탐색",
+      "byStance": true,
+      "duty": null,
+      "deadlineDays": null,
+      "deadlineFrom": null,
+      "legalBasis": null,
+      "effectiveDate": null,
+      "officialUrl": null,
+      "profession": null
+    },
+    {
+      "key": "visit",
+      "name": "임장",
+      "byStance": true,
+      "duty": null,
+      "deadlineDays": null,
+      "deadlineFrom": null,
+      "legalBasis": null,
+      "effectiveDate": null,
+      "officialUrl": null,
+      "profession": null
+    },
+    {
+      "key": "contract",
+      "name": "계약",
+      "byStance": false,
+      "duty": "부동산 거래신고",
+      "deadlineDays": 30,
+      "deadlineFrom": "계약 체결일",
+      "legalBasis": "부동산 거래신고 등에 관한 법률 제3조제1항",
+      "effectiveDate": null,
+      "officialUrl": "https://www.law.go.kr/법령/부동산거래신고등에관한법률/제3조",
+      "profession": "공인중개사"
+    },
+    {
+      "key": "balance",
+      "name": "잔금",
+      "byStance": false,
+      "duty": "소유권이전등기 신청",
+      "deadlineDays": 60,
+      "deadlineFrom": "반대급부의 이행이 완료된 날",
+      "legalBasis": "부동산등기 특별조치법 제2조제1항제1호",
+      "effectiveDate": "2022-01-01",
+      "officialUrl": "https://www.law.go.kr/법령/부동산등기특별조치법/제2조",
+      "profession": null
+    },
+    {
+      "key": "acquisitionTax",
+      "name": "취득세",
+      "byStance": false,
+      "duty": "취득세 신고와 납부",
+      "deadlineDays": 60,
+      "deadlineFrom": "취득한 날",
+      "legalBasis": "지방세법 제20조제1항",
+      "effectiveDate": "2026-01-01",
+      "officialUrl": "https://www.law.go.kr/법령/지방세법/제20조",
+      "profession": "세무사"
+    },
+    {
+      "key": "registration",
+      "name": "등기",
+      "byStance": false,
+      "duty": null,
+      "deadlineDays": null,
+      "deadlineFrom": null,
+      "legalBasis": null,
+      "effectiveDate": null,
+      "officialUrl": null,
+      "profession": "법무사"
+    },
+    {
+      "key": "moveIn",
+      "name": "전입",
+      "byStance": false,
+      "duty": "전입신고",
+      "deadlineDays": 14,
+      "deadlineFrom": "신거주지에 전입한 날",
+      "legalBasis": "주민등록법 제16조제1항",
+      "effectiveDate": "2025-07-22",
+      "officialUrl": "https://www.law.go.kr/법령/주민등록법/제16조",
+      "profession": null
+    }
+  ],
+  "orderRules": [
+    {
+      "first": "acquisitionTax",
+      "then": "registration",
+      "until": "등기신청서를 접수하는 날까지",
+      "legalBasis": "지방세법 제20조제4항",
+      "effectiveDate": "2026-01-01",
+      "officialUrl": "https://www.law.go.kr/법령/지방세법/제20조"
+    }
+  ]
+}
