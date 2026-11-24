@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from decimal import localcontext
 from unittest import mock
 
@@ -389,6 +390,37 @@ class RunSummaryTest(unittest.TestCase):
         ):
             collect.main()
         self.assertIn("시작 시각이 비어 있거나", stdout.getvalue())
+
+
+class MonthsBackTest(unittest.TestCase):
+    def test_this_month_follows_kst_when_runner_clock_is_still_last_month(self):
+        # UTC 2026-11-30 20:17 = KST 2026-12-01 05:17
+        runner_now = datetime(2026, 11, 30, 20, 17, tzinfo=timezone.utc)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                # 시간대 없이 부르면 러너 시계를 쓰는 옛 동작. 테스트가 호스트 시간대에 기대지 않게 거부
+                if tz is None:
+                    raise AssertionError("시간대 없이 now() 호출")
+                return runner_now.astimezone(tz)
+
+        with mock.patch.object(collect, "datetime", FixedDatetime):
+            self.assertEqual(collect.months_back(3), ["202611", "202610", "202609"])
+
+    def test_january_rolls_back_to_previous_year(self):
+        runner_now = datetime(2027, 1, 15, 3, 0, tzinfo=timezone.utc)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                # 시간대 없이 부르면 러너 시계를 쓰는 옛 동작. 테스트가 호스트 시간대에 기대지 않게 거부
+                if tz is None:
+                    raise AssertionError("시간대 없이 now() 호출")
+                return runner_now.astimezone(tz)
+
+        with mock.patch.object(collect, "datetime", FixedDatetime):
+            self.assertEqual(collect.months_back(2), ["202612", "202611"])
 
 
 if __name__ == "__main__":

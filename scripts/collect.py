@@ -42,12 +42,13 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, DefaultContext, InvalidOperation, ROUND_HALF_UP, localcontext
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -146,8 +147,13 @@ def months_back(count: int, skip: int = 1) -> list:
     기본값 skip=1 로 이번 달을 빼는 이유
       - 거래 후 30일 안에 신고하면 되므로 최근 1~2개월은 아직 덜 들어옴
       - 그대로 쓰면 거래가 갑자기 줄어든 것처럼 보임
+
+    이번 달은 KST 기준
+      - 러너 시계는 UTC, 실행은 KST 05:17
+      - date.today()는 매달 KST 1일에 지난달을 이번 달로 봄
+      - 파생값 갱신 함수의 창도 KST 지난달에서 끝남. 기준이 다르면 그날 창의 마지막 달이 빔
     """
-    today = date.today()
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
     y, m = today.year, today.month
     for _ in range(skip):
         m -= 1
