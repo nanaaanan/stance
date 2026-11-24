@@ -23,6 +23,7 @@ npm run dev        # 개발 서버
 npm run build      # 프로덕션 빌드 (푸시 전 반드시 통과)
 npm run lint       # ESLint
 npm run test       # Vitest. src/lib/domain 의 순수 함수만
+npm run test:mutation   # Stryker. 뮤테이션 스코어가 70 아래면 실패
 ```
 
 ## 디렉토리
