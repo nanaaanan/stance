@@ -22,7 +22,7 @@
 npm run dev        # 개발 서버
 npm run build      # 프로덕션 빌드 (푸시 전 반드시 통과)
 npm run lint       # ESLint
-npm run test       # Vitest (도입 후)
+npm run test       # Vitest. src/lib/domain 의 순수 함수만
 ```
 
 ## 디렉토리
