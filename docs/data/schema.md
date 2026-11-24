@@ -42,7 +42,7 @@
 
 <br/>
 
-## 테이블 9개와 관계
+## 테이블 10개와 관계
 
 ```
                   수집 배치 (Python)
@@ -79,8 +79,9 @@
 | `collect_run`     | 수집 시도 1회                   | 덮어쓰지 않고 계속 쌓임    |
 | `trade_group_stats` | 단지의 표시 그룹 1개 | 갱신 함수가 전체 교체 |
 | `trade_complex_stats` | 단지의 매매 건수와 회전율 재료 | 갱신 함수가 전체 교체 |
+| `rent_group_stats` | 단지의 표시그룹 1개의 전월세 파생값 | 갱신 함수가 전체 교체 |
 
-`collect_count_history` 는 `collect_run` 에서 첫 관측과 건수 변화 시점을 읽는 뷰다. 별도로 저장하지 않는다.
+`collect_count_history`는 `collect_run`에서 첫 관측과 건수 변화 시점을 읽는 뷰다. 별도로 저장하지 않는다. `group_jeonse_ratio_view`는 매매와 전월세 파생값 표를 이어 전세가율을 내는 뷰다.
 
 ### 매매와 전월세를 한 테이블로 합치지 않은 이유
 
@@ -226,7 +227,7 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 | `excluded_cancel` | `integer` | 창 안 '해제'의 `sum(trade_count)` |
 | `excluded_direct` | `integer` | 창 안 '직거래'의 `sum(trade_count)` |
 | `last_valid_ym` | `text` | 전 기간 유효 거래의 마지막 계약월. 없으면 NULL |
-| `window_start_ym` `window_end_ym` | `text` | 숫자 6자리 계약월. 현재 KST(한국 표준시) 달을 포함한 12개월 |
+| `window_start_ym` `window_end_ym` | `text` | 숫자 6자리 계약월. 현재 KST(한국 표준시) 달의 지난달에서 끝나는 12개월. 수집이 이번 달 계약분을 받지 않기 때문 |
 | `refreshed_at` | `timestamptz` | 파생값 계산 시각 |
 
 유효 건수 0일 때에만 세 가격이 모두 NULL이다. 최저가는 최고가 이하여야 하고, 제외 건수는 각각 0 이상이다. 검색용 인덱스는 `trade_group_stats_min_price_idx (min_price)`다. 면적 칸은 두지 않는다.
@@ -264,7 +265,7 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 
 #### 갱신과 읽는 쪽 계약
 
-갱신 명령은 `python3 scripts/refresh_stats.py`다. 환경변수 `SUPABASE_URL`(없으면 `NEXT_PUBLIC_SUPABASE_URL`)과 `SUPABASE_SERVICE_ROLE_KEY`로 DB 함수 원격 호출(RPC) `public.refresh_trade_stats()`를 한 번 호출하며 재시도하지 않는다. 수집 단계가 종료 코드 0일 때만 호출한다.
+갱신 명령은 `python3 scripts/refresh_stats.py`다. 환경변수 `SUPABASE_URL`(없으면 `NEXT_PUBLIC_SUPABASE_URL`)과 `SUPABASE_SERVICE_ROLE_KEY`로 DB 함수 원격 호출(RPC) `public.refresh_trade_stats()`와 `public.refresh_rent_stats()`를 차례로 한번씩 호출하며 재시도하지 않는다. 앞의 것이 실패하면 뒤의 것은 부르지 않는다. 수집 단계가 종료 코드 0일 때만 호출한다.
 
 갱신 함수는 두 결과 표를 EXCLUSIVE 모드로 잠가 동시 갱신을 직렬화하고, DELETE 후 두 INSERT와 요약을 SQL 문장 하나에서 계산한다. 읽기는 계속 가능하며, 실패하면 이전 값이 남는다. `complex`에 없는 단지의 거래는 저장하지 않고 반환값 `trades_without_complex`에 `sum(trade_count)`로 집계한다. 반환값은 `window_start_ym`, `window_end_ym`, `refreshed_at`, `group_rows`, `complex_rows`, `valid_count`, `ungrouped_valid_count`, `trades_without_complex`다.
 
@@ -272,8 +273,8 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 
 | 상태 | 조건 |
 | --- | --- |
-| 현재 값 | `window_end_ym`이 현재 KST 달과 같음 |
-| 오래된 값 | `window_end_ym`이 현재 KST 달과 다름 |
+| 현재 값 | `window_end_ym`이 현재 KST 달의 지난달과 같음 |
+| 오래된 값 | `window_end_ym`이 현재 KST 달의 지난달과 다름 |
 | 미계산 | 표가 비어 있음 |
 
 최근 3개월 밖 해제가 원장에 자동 반영되지 않는 제한은 아래 "알려진 한계"의 "오래된 구간의 정정, 해제"와 같다.
@@ -299,6 +300,44 @@ rent   (apt_seq, deal_date, exclu_use_ar, floor, deposit, monthly_rent)
 | `umd_cd`         | 전월세 응답에 없다                     |
 | 해제/직거래 관련 | 필드 자체가 없다                       |
 | `is_jeonse`      | `monthly_rent = 0` 과 같은 말이라 중복 |
+
+### rent_group_stats
+
+전월세 파생값이다. 창 안에 현재 행인 전월세가 하나 이상 있는 `(apt_seq, group_id)`를 저장한다. 창은 매매 파생값과 같은 식으로 계산한다. `complex`에 없는 단지와 그룹이 없는 면적의 전월세는 저장하지 않고 갱신 함수의 반환값에 건수만 싣는다.
+
+| 컬럼 | 타입 | 비고 |
+| --- | --- | --- |
+| `apt_seq` | `text` | PK 일부. `complex(apt_seq)` 참조 |
+| `group_id` | `text` | PK 일부. 표시그룹 식별자 |
+| `jeonse_count` | `integer` | 창 안 순수전세(`monthly_rent = 0`)의 `sum(trade_count)` |
+| `ratio_base_deposit` | `numeric` | 전세가율 분자 전용. 순수전세 보증금의 건수 가중 평균. 만원, 반올림 없음. 0건이면 NULL |
+| `renewal_count` | `integer` | 갱신계약 재료의 수. 조건은 아래 |
+| `renewal_pre_deposit_avg` | `numeric` | 그 계약들의 종전 보증금 평균. 만원. 0건이면 NULL |
+| `renewal_deposit_avg` | `numeric` | 그 계약들의 지금 보증금 평균. 만원. 0건이면 NULL |
+| `window_start_ym` `window_end_ym` | `text` | 숫자 6자리 계약월 |
+| `refreshed_at` | `timestamptz` | 파생값 계산 시각 |
+
+갱신계약 재료는 `contract_type = '갱신'`, `monthly_rent = 0`, `pre_deposit > 0`, `coalesce(pre_monthly_rent, 0) = 0`, `trade_count = 1`을 모두 채우는 행이다.
+
+- 종전 월세가 0인 계약은 원본의 `preMonthlyRent`가 빈 값으로 온다. DB에는 NULL이라 `pre_monthly_rent = 0`으로만 비교하면 거의 전부 빠진다
+- `trade_count = 1`만 쓰는 것은 종전 값이 자연키 밖이기 때문이다. 여러 계약이 한 행으로 합쳐질 때 종전 값이 서로 다르면 그 칸이 NULL이 되고, 이 NULL은 빈 값에서 온 NULL과 구별되지 않는다
+
+읽는 쪽은 매매 파생값과 같은 세 상태를 구분한다. 그룹의 행이 없으면 창 안에 전월세가 없다는 뜻이고, 표 전체가 비었으면 미계산이다.
+
+### group_jeonse_ratio_view (뷰)
+
+`trade_group_stats`의 그룹마다 창이 같은 `rent_group_stats` 행을 이어 전세가율을 낸다. 비율을 저장하지 않는 것은 두 표가 따로 갱신되기 때문이다.
+
+| 컬럼 | 비고 |
+| --- | --- |
+| `apt_seq` `group_id` | 매매 파생값 표의 키 |
+| `jeonse_ratio` | `ratio_base_deposit / ratio_base_price`. 반올림 없음. 순수전세나 유효 매매가 없으면 NULL |
+| `jeonse_count` | 전월세 쪽 건수. 전월세 행이 없거나 두 표의 창이 다르면 NULL |
+| `trade_valid_count` | 매매 쪽 유효 건수 |
+| `window_start_ym` `window_end_ym` | 매매 쪽 창 |
+| `trade_refreshed_at` `rent_refreshed_at` | 두 표의 계산 시각. 같은 창 안에서도 서로 다를 수 있다 |
+
+매매 파생값 행이 없는 그룹은 이 뷰에 없다. 판정 라벨이나 임계값은 붙이지 않는다. 비율이 1을 넘는 그룹도 값 그대로 나온다.
 
 ### complex
 
@@ -672,6 +711,7 @@ trg_rent_keep_filled
 | 자연키 중복 병합 (해제 쌍 합치기)       | `scripts/collect.py`             | 적재 직전          |
 | 빈 값이 채워진 값을 덮지 않게           | DB 트리거 `keep_filled_values`   | UPDATE 직전        |
 | 유효 거래 판정과 매매 파생값 저장 | DB 함수 `trade_stat_reason` + `refresh_trade_stats` | 갱신할 때 |
+| 순수전세와 갱신계약 재료 판정, 전월세 파생값 저장 | DB 함수 `refresh_rent_stats` | 갱신할 때 |
 | DB 판정과 같은 규칙 대조 | `src/lib/domain/clean.ts` (S2 예정) | 고정 입력으로 대조하는 순수 함수 |
 
 기준은 **"원본을 바꾸는가"** 다.
@@ -694,16 +734,18 @@ trg_rent_keep_filled
 | `complex_area_registry_view` (뷰) | 읽기만                        | 읽기만                      |
 | `deal_change_log` `collect_run` | 접근 불가                       | 읽기, 넣기, 고치기           |
 | `collect_count_history` (뷰)    | 접근 불가                       | 읽기만                      |
-| `trade_group_stats` `trade_complex_stats` | 읽기만 | 읽기만. 쓰기는 갱신 함수 내부에서만 |
+| `trade_group_stats` `trade_complex_stats` `rent_group_stats` | 읽기만 | 읽기만. 쓰기는 갱신 함수 내부에서만 |
+| `group_jeonse_ratio_view` (뷰) | 읽기만 | 읽기만 |
 
 | 함수 | anon / authenticated | service_role |
 | --- | --- | --- |
 | `trade_stat_reason(boolean, boolean, text, text)` | 실행 불가 | 실행 가능 |
 | `refresh_trade_stats()` | 실행 불가 | 실행 가능 |
+| `refresh_rent_stats()` | 실행 불가 | 실행 가능 |
 
-두 함수는 PUBLIC, anon, authenticated의 실행 권한을 회수한 뒤 service_role에만 실행 권한을 준다. 갱신 함수는 소유자 권한(`security definer`)으로 실행하며 `search_path = ''`로 고정하고 본문의 테이블과 함수에 `public.`을 붙인다.
+세 함수는 PUBLIC, anon, authenticated의 실행 권한을 회수한 뒤 service_role에만 실행 권한을 준다. 갱신 함수는 소유자 권한(`security definer`)으로 실행하며 `search_path = ''`로 고정하고 본문의 테이블과 함수에 `public.`을 붙인다.
 
-- RLS 는 9개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area`/`reb_complex`/`trade_group_stats`/`trade_complex_stats`에 전체 읽기 정책을 둔다
+- RLS는 10개 테이블 모두 켠다. `trade`/`rent`/`complex`/`complex_area`/`reb_complex`/`trade_group_stats`/`trade_complex_stats`/`rent_group_stats`에 전체 읽기 정책을 둔다
 - `anon` 을 넣는 이유: 익명 세션 발급이 끝나기 전에 데이터를 요청하는 구간이 있고, 그때 역할은 `authenticated` 가 아니라 `anon` 이다
 - 수집 스크립트에 **DELETE 를 주지 않는다.** 이 설계는 upsert 와 표시만 쓰므로 지울 일이 없다. 권한이 없으면 실수도 없다
 - Supabase 는 새 테이블에 권한을 자동으로 주므로 `revoke` 를 먼저 하고 `grant` 한다. `grant` 는 더하기만 하기 때문이다
@@ -855,6 +897,7 @@ select v,
 | 해제/과거 행도 브라우저에 노출 | 읽기 정책이 전체 허용이라 앱이 필터를 빠뜨리면 화면에 뜬다                     |
 | 수집 중 신고가 들어오면        | 페이지 경계가 어긋날 수 있다. 다음 회차 upsert 로 흡수된다                     |
 | 오래된 구간의 정정, 해제       | 최근 3개월만 다시 수집하므로 그 밖의 변화는 반영되지 않는다                    |
+| 합쳐진 전월세 행의 종전 값 | 자연키가 같은 계약이 한 행으로 합쳐지면 종전 보증금과 종전 월세를 계약별로 알 수 없다. 갱신계약 재료에서 뺀다 |
 | 값을 일부러 비울 수 없다       | 빈 값 보호 트리거가 막는다. 아래 참고                                          |
 | 넣은 수를 세는 방식            | 같은 구간을 두 프로세스가 동시에 돌면 계산이 어긋난다. 아래 참고               |
 

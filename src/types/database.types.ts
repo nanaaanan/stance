@@ -360,6 +360,60 @@ export type Database = {
         }
         Relationships: []
       }
+      rent_group_stats: {
+        Row: {
+          apt_seq: string
+          group_id: string
+          jeonse_count: number
+          ratio_base_deposit: number | null
+          refreshed_at: string
+          renewal_count: number
+          renewal_deposit_avg: number | null
+          renewal_pre_deposit_avg: number | null
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Insert: {
+          apt_seq: string
+          group_id: string
+          jeonse_count: number
+          ratio_base_deposit?: number | null
+          refreshed_at: string
+          renewal_count: number
+          renewal_deposit_avg?: number | null
+          renewal_pre_deposit_avg?: number | null
+          window_end_ym: string
+          window_start_ym: string
+        }
+        Update: {
+          apt_seq?: string
+          group_id?: string
+          jeonse_count?: number
+          ratio_base_deposit?: number | null
+          refreshed_at?: string
+          renewal_count?: number
+          renewal_deposit_avg?: number | null
+          renewal_pre_deposit_avg?: number | null
+          window_end_ym?: string
+          window_start_ym?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "rent_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+          {
+            foreignKeyName: "rent_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
       trade: {
         Row: {
           ambiguous_cancel: boolean
@@ -635,8 +689,38 @@ export type Database = {
           },
         ]
       }
+      group_jeonse_ratio_view: {
+        Row: {
+          apt_seq: string | null
+          group_id: string | null
+          jeonse_count: number | null
+          jeonse_ratio: number | null
+          rent_refreshed_at: string | null
+          trade_refreshed_at: string | null
+          trade_valid_count: number | null
+          window_end_ym: string | null
+          window_start_ym: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "trade_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex"
+            referencedColumns: ["apt_seq"]
+          },
+          {
+            foreignKeyName: "trade_group_stats_apt_seq_fkey"
+            columns: ["apt_seq"]
+            isOneToOne: false
+            referencedRelation: "complex_registry_view"
+            referencedColumns: ["apt_seq"]
+          },
+        ]
+      }
     }
     Functions: {
+      refresh_rent_stats: { Args: never; Returns: Json }
       refresh_trade_stats: { Args: never; Returns: Json }
       trade_stat_reason: {
         Args: {

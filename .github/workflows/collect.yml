@@ -115,7 +115,7 @@ jobs:
         run: python3 scripts/load_complex.py
       # shell: bash 는 pipefail 을 켬
       #   - 없으면 갱신이 실패해도 tee 때문에 성공으로 보임
-      - name: 매매 파생값 갱신
+      - name: 파생값 갱신
         shell: bash
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
