@@ -62,3 +62,22 @@ jobs:
             --config=p/default --config=p/secrets \
             --metrics=off \
             --severity=ERROR --error --quiet
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          # Stryker가 Node 22 이상을 요구
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: 단위 테스트
+        run: npm run test
+      # 점수가 stryker.config.json의 break 값보다 낮으면 종료코드 1
+      - name: 뮤테이션 테스트
+        run: npm run test:mutation
